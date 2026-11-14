@@ -1,0 +1,47 @@
+{
+  "manifest_version": 3,
+  "name": "Any Agent — Local Ollama Browser Agent",
+  "version": "1.0.0",
+  "description": "100% local, privacy-first Chrome side-panel AI agent powered by Ollama (deepseek-r1:8b, gemma4, etc.) with persistent personal memory.",
+  "permissions": [
+    "sidePanel",
+    "activeTab",
+    "tabs",
+    "scripting",
+    "storage",
+    "declarativeNetRequest"
+  ],
+  "host_permissions": [
+    "<all_urls>",
+    "http://localhost:11434/*",
+    "http://127.0.0.1:11434/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "side_panel": {
+    "default_path": "index.html"
+  },
+  "action": {
+    "default_title": "Open Any Agent Side Panel"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "ollama_cors_rules",
+        "enabled": true,
+        "path": "rules.json"
+      }
+    ]
+  }
+}
+

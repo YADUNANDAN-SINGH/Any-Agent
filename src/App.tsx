@@ -1,0 +1,1114 @@
+import React, { useEffect, useRef, useState } from 'react';
+import {
+  Bot,
+  Database,
+  Eye,
+  FileText,
+  MessageSquare,
+  Send,
+  Settings,
+  Sparkles,
+  Square,
+  Trash2,
+  Wand2,
+  BookmarkPlus,
+  MousePointerClick,
+} from 'lucide-react';
+import type {
+  AgentSettings,
+  ChatMessage,
+  PageSnapshot,
+  PersonalProfile,
+  StepTrace,
+} from './types/agent';
+import {
+  DEFAULT_PROFILE,
+  DEFAULT_SETTINGS,
+  loadProfile,
+  loadSettings,
+  loadKnowledge,
+  saveKnowledge,
+  saveProfile,
+  saveSettings,
+} from './lib/storage';
+import {
+  LONG_PROFILE_FIELDS,
+  PROFILE_FIELDS,
+  getLearnedFacts,
+  mergeSkills,
+  mightContainPersonalInfo,
+  normalizeFact,
+  retrieveRelevantKnowledge,
+  withLearnedFacts,
+} from './lib/knowledge';
+import { extractMemoryUpdatesFromChat } from './lib/ollama';
+import { Brain, Check, Copy, Loader2, Reply, Undo2, X } from 'lucide-react';
+import { KnowledgePanel } from './components/KnowledgePanel';
+import type { KnowledgeEntry, MemoryUpdateInfo } from './types/agent';
+import {
+  buildAgentPrompt,
+  fetchOllamaModels,
+  streamOllamaStep,
+  type OllamaModelTag,
+} from './lib/ollama';
+import {
+  executeActionsOnActiveTab,
+  getActivePageSnapshot,
+} from './lib/browserBridge';
+import { MemoryPanel } from './components/MemoryPanel';
+import { SettingsPanel } from './components/SettingsPanel';
+import { StepTraceCard } from './components/StepTraceCard';
+import { MarkdownRenderer } from './components/MarkdownRenderer';
+import { ErrorBoundary } from './components/ErrorBoundary';
+import { isScreenshotRequestedPrompt } from './lib/ollama';
+
+type ActiveTab = 'chat' | 'memory' | 'settings';
+
+const QUICK_PROMPTS = [
+  {
+    label: 'Summarize this webpage & key takeaways',
+    prompt:
+      'Summarize this webpage clearly with bullet points, key facts, and main takeaways.',
+    icon: FileText,
+  },
+  {
+    label: 'Save my details from this page into Memory',
+    prompt:
+      'Read this webpage and extract any relevant personal profile info (bio, projects, links, skills, role, education) into my Personal Memory using extract_to_memory actions, and summarize what you found.',
+    icon: BookmarkPlus,
+  },
+  {
+    label: 'Fill out form on this page using Memory',
+    prompt: 'Fill out all relevant form fields on this page using my personal memory.',
+    icon: Wand2,
+  },
+  {
+    label: 'What actions or links are on this page?',
+    prompt:
+      'Analyze this page and tell me what interactive buttons, links, or forms are available and what they do.',
+    icon: MousePointerClick,
+  },
+];
+
+export const App: React.FC = () => {
+  const [activeTab, setActiveTab] = useState<ActiveTab>('chat');
+  const [profile, setProfile] = useState<PersonalProfile>(DEFAULT_PROFILE);
+  const [settings, setSettings] = useState<AgentSettings>(DEFAULT_SETTINGS);
+  const [availableModels, setAvailableModels] = useState<OllamaModelTag[]>([]);
+  const [ollamaConnected, setOllamaConnected] = useState<boolean>(false);
+
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [input, setInput] = useState('');
+  const [isRunning, setIsRunning] = useState(false);
+  const [lastSnapshot, setLastSnapshot] = useState<PageSnapshot | null>(null);
+  const [knowledge, setKnowledge] = useState<KnowledgeEntry[]>([]);
+  const [memoryView, setMemoryView] = useState<'profile' | 'knowledge'>('profile');
+
+  const handleSaveKnowledge = async (entries: KnowledgeEntry[]) => {
+    knowledgeRef.current = entries;
+    setKnowledge(entries);
+    await saveKnowledge(entries);
+  };
+  const [showDomPreview, setShowDomPreview] = useState(false);
+
+  // Refs always hold the latest memory so background learning never works on stale state
+  const profileRef = useRef<PersonalProfile>(profile);
+  const knowledgeRef = useRef<KnowledgeEntry[]>(knowledge);
+  useEffect(() => {
+    profileRef.current = profile;
+  }, [profile]);
+  useEffect(() => {
+    knowledgeRef.current = knowledge;
+  }, [knowledge]);
+
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const chatBottomRef = useRef<HTMLDivElement | null>(null);
+
+  // ----- Highlight-to-reply -----
+  const chatScrollRef = useRef<HTMLDivElement | null>(null);
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const [replyQuote, setReplyQuote] = useState<string | null>(null);
+  const [selectionPopup, setSelectionPopup] = useState<{
+    text: string;
+    x: number;
+    y: number;
+  } | null>(null);
+  const [copiedSelection, setCopiedSelection] = useState(false);
+
+  const handleChatSelection = () => {
+    // Defer so the browser has finalized the selection
+    setTimeout(() => {
+      const sel = window.getSelection();
+      const text = sel?.toString().trim() || '';
+      if (
+        !sel ||
+        sel.rangeCount === 0 ||
+        text.length < 2 ||
+        !chatScrollRef.current?.contains(sel.anchorNode)
+      ) {
+        setSelectionPopup(null);
+        return;
+      }
+      const rect = sel.getRangeAt(0).getBoundingClientRect();
+      const x = Math.min(Math.max(rect.left + rect.width / 2, 70), window.innerWidth - 70);
+      const y = rect.top > 52 ? rect.top - 40 : rect.bottom + 8;
+      setCopiedSelection(false);
+      setSelectionPopup({ text: text.slice(0, 1500), x, y });
+    }, 0);
+  };
+
+  useEffect(() => {
+    const onSelectionChange = () => {
+      if (!window.getSelection()?.toString().trim()) setSelectionPopup(null);
+    };
+    document.addEventListener('selectionchange', onSelectionChange);
+    return () => document.removeEventListener('selectionchange', onSelectionChange);
+  }, []);
+
+  const startReplyToSelection = () => {
+    if (!selectionPopup) return;
+    setReplyQuote(selectionPopup.text);
+    setSelectionPopup(null);
+    window.getSelection()?.removeAllRanges();
+    setTimeout(() => inputRef.current?.focus(), 0);
+  };
+
+  const copySelection = async () => {
+    if (!selectionPopup) return;
+    try {
+      await navigator.clipboard.writeText(selectionPopup.text);
+      setCopiedSelection(true);
+      setTimeout(() => setSelectionPopup(null), 700);
+    } catch {
+      setSelectionPopup(null);
+    }
+  };
+
+  const sendFromInput = () => {
+    if (!input.trim() || isRunning) return;
+    const quote = replyQuote || undefined;
+    setReplyQuote(null);
+    runMultiStepAgent(input, quote);
+  };
+
+  useEffect(() => {
+    (async () => {
+      const [loadedProfile, loadedSettings] = await Promise.all([
+        loadProfile(),
+        loadSettings(),
+      ]);
+      setProfile(loadedProfile);
+      setSettings(loadedSettings);
+      setKnowledge(await loadKnowledge());
+      await checkOllama(loadedSettings.ollamaHost, loadedSettings.selectedModel);
+    })();
+  }, []);
+
+  useEffect(() => {
+    chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
+
+  const checkOllama = async (host: string, currentModel: string) => {
+    try {
+      const models = await fetchOllamaModels(host);
+      setAvailableModels(models);
+      setOllamaConnected(true);
+      if (models.length > 0 && !models.some((m) => m.name === currentModel)) {
+        const nextSettings = { ...settings, ollamaHost: host, selectedModel: models[0].name };
+        setSettings(nextSettings);
+        await saveSettings(nextSettings);
+      }
+    } catch {
+      setOllamaConnected(false);
+    }
+  };
+
+  const handleSaveProfile = async (updated: PersonalProfile) => {
+    profileRef.current = updated;
+    setProfile(updated);
+    await saveProfile(updated);
+  };
+
+  const setMessageMemoryUpdate = (msgId: string, mu: MemoryUpdateInfo | undefined) => {
+    setMessages((prev) => prev.map((m) => (m.id === msgId ? { ...m, memoryUpdate: mu } : m)));
+  };
+
+  /** Runs after a chat turn: learns new durable facts the user shared about themselves. */
+  const learnFromChat = async (
+    userMessage: string,
+    assistantMsgId: string,
+    prevAssistant: string
+  ) => {
+    if (settings.autoLearnFromChat === false) return;
+    if (!mightContainPersonalInfo(userMessage)) return;
+    if (QUICK_PROMPTS.some((q) => q.prompt === userMessage)) return;
+
+    const empty: MemoryUpdateInfo = {
+      status: 'pending',
+      items: [],
+      profileChanges: [],
+      addedFacts: [],
+      removedFacts: [],
+    };
+    setMessageMemoryUpdate(assistantMsgId, empty);
+
+    try {
+      const currentProfile = profileRef.current;
+      const currentFacts = getLearnedFacts(knowledgeRef.current);
+
+      const res = await extractMemoryUpdatesFromChat({
+        host: settings.ollamaHost,
+        model: settings.selectedModel,
+        userMessage,
+        assistantContext: prevAssistant,
+        profile: currentProfile,
+        knownFacts: currentFacts,
+      });
+
+      const items: string[] = [];
+      const profileChanges: MemoryUpdateInfo['profileChanges'] = [];
+      const factCandidates = [...res.newFacts];
+      const nextProfile = { ...currentProfile };
+
+      for (const [k, v] of Object.entries(res.profileUpdates)) {
+        const key = k as keyof PersonalProfile;
+        const prev = (currentProfile[key] || '').trim();
+        let next = String(v).trim();
+
+        // Never clobber long free-text fields from one chat line; remember it as a fact instead
+        if (LONG_PROFILE_FIELDS.has(key) && prev) {
+          factCandidates.push(next);
+          continue;
+        }
+        if (key === 'skills' && prev) next = mergeSkills(prev, next);
+        if (!next || next === prev) continue;
+
+        nextProfile[key] = next;
+        profileChanges.push({ key, prev, next });
+        const label = PROFILE_FIELDS.find((f) => f.key === key)?.label || key;
+        items.push(`${prev ? 'Updated' : 'Set'} ${label}: ${next.slice(0, 80)}`);
+      }
+
+      const known = new Set(currentFacts.map(normalizeFact));
+      const addedFacts: string[] = [];
+      for (const f of factCandidates) {
+        const n = normalizeFact(f);
+        if (n && !known.has(n)) {
+          known.add(n);
+          addedFacts.push(f);
+          items.push(`Remembered: ${f}`);
+        }
+      }
+
+      const removedFacts = res.removeFactIds
+        .map((id) => currentFacts[id - 1])
+        .filter((f): f is string => Boolean(f));
+      removedFacts.forEach((f) => items.push(`Forgot: ${f}`));
+
+      if (items.length === 0) {
+        setMessageMemoryUpdate(assistantMsgId, undefined);
+        return;
+      }
+
+      if (profileChanges.length > 0) await handleSaveProfile(nextProfile);
+      if (addedFacts.length > 0 || removedFacts.length > 0) {
+        const facts = [
+          ...currentFacts.filter((f) => !removedFacts.includes(f)),
+          ...addedFacts,
+        ];
+        await handleSaveKnowledge(withLearnedFacts(knowledgeRef.current, facts));
+      }
+
+      setMessageMemoryUpdate(assistantMsgId, {
+        status: 'done',
+        items,
+        profileChanges,
+        addedFacts,
+        removedFacts,
+      });
+    } catch (err) {
+      console.warn('[Any Agent] Memory learning skipped:', err);
+      setMessageMemoryUpdate(assistantMsgId, undefined);
+    }
+  };
+
+  /** Reverts exactly the changes a specific memory update made. */
+  const undoMemoryUpdate = async (msgId: string) => {
+    const mu = messages.find((m) => m.id === msgId)?.memoryUpdate;
+    if (!mu || mu.status !== 'done') return;
+
+    if (mu.profileChanges.length > 0) {
+      const p = { ...profileRef.current };
+      for (const c of mu.profileChanges) {
+        if ((p[c.key] || '').trim() === c.next) p[c.key] = c.prev;
+      }
+      await handleSaveProfile(p);
+    }
+
+    if (mu.addedFacts.length > 0 || mu.removedFacts.length > 0) {
+      let facts = getLearnedFacts(knowledgeRef.current).filter(
+        (f) => !mu.addedFacts.includes(f)
+      );
+      facts = [...facts, ...mu.removedFacts.filter((f) => !facts.includes(f))];
+      await handleSaveKnowledge(withLearnedFacts(knowledgeRef.current, facts));
+    }
+
+    setMessageMemoryUpdate(msgId, { ...mu, status: 'undone' });
+  };
+
+  const handleUpdateSettings = async (updated: AgentSettings) => {
+    setSettings(updated);
+    await saveSettings(updated);
+    await checkOllama(updated.ollamaHost, updated.selectedModel);
+  };
+
+  const handleInspectDom = async () => {
+    try {
+      const snap = await getActivePageSnapshot();
+      setLastSnapshot(snap);
+      setShowDomPreview((prev) => !prev);
+    } catch (err: any) {
+      alert(err?.message || 'Could not inspect current tab.');
+    }
+  };
+
+  const stopAgentLoop = () => {
+    abortControllerRef.current?.abort();
+    setIsRunning(false);
+  };
+
+  const runMultiStepAgent = async (userPrompt: string, quote?: string) => {
+    if (!userPrompt.trim() || isRunning) return;
+
+    const prevAssistant =
+      [...messages].reverse().find((m) => m.role === 'assistant')?.content || '';
+
+    const userMsg: ChatMessage = {
+      id: `user-${Date.now()}`,
+      role: 'user',
+      content: userPrompt.trim(),
+      quote,
+      timestamp: Date.now(),
+    };
+
+    const assistantMsgId = `assistant-${Date.now() + 1}`;
+    const initialAssistantMsg: ChatMessage = {
+      id: assistantMsgId,
+      role: 'assistant',
+      content: 'Reading active webpage...',
+      timestamp: Date.now(),
+      steps: [],
+      isStreaming: true,
+    };
+
+    setMessages((prev) => [...prev, userMsg, initialAssistantMsg]);
+    setInput('');
+    setIsRunning(true);
+
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
+
+    const stepsTrace: StepTrace[] = [];
+    const previousSummaries: string[] = [];
+    let workingProfile = { ...profile };
+
+    const syncAssistantMessage = (content: string, isStreaming: boolean) => {
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === assistantMsgId
+            ? {
+                ...m,
+                content,
+                steps: [...stepsTrace],
+                isStreaming,
+              }
+            : m
+        )
+      );
+    };
+
+    try {
+      let finalAnswer = '';
+      let forceScreenshotsNextStep = isScreenshotRequestedPrompt(userPrompt);
+
+      for (let stepNum = 1; stepNum <= settings.maxSteps; stepNum++) {
+        if (abortController.signal.aborted) break;
+
+        // 1. Observe: DOM text + interactive elements, with screenshot fallback
+        syncAssistantMessage(
+          forceScreenshotsNextStep ? 'Capturing page screenshots...' : 'Reading active webpage...',
+          true
+        );
+        const snapshot = await getActivePageSnapshot({
+          forceScreenshots: forceScreenshotsNextStep,
+          autoScreenshotFallback: settings.autoScreenshotFallback ?? true,
+          maxScreenshots: settings.maxScreenshots ?? 4,
+        });
+        forceScreenshotsNextStep = false;
+        setLastSnapshot(snapshot);
+
+        const screenshots = snapshot.screenshots || [];
+        const modelForStep =
+          screenshots.length > 0
+            ? settings.visionModel || settings.selectedModel
+            : settings.selectedModel;
+
+        const currentStep: StepTrace = {
+          stepNumber: stepNum,
+          pageTitle: snapshot.title,
+          thinking: '',
+          summary:
+            screenshots.length > 0
+              ? `Reading ${screenshots.length} screenshot(s) with ${modelForStep}...`
+              : '',
+          screenshots: screenshots.length > 0 ? screenshots : undefined,
+          actions: [],
+          status: 'running',
+        };
+        stepsTrace.push(currentStep);
+        syncAssistantMessage(`Step ${stepNum}: Analyzing "${snapshot.title}"...`, true);
+
+        // 2. Think: Stream from local Ollama model
+        const { system, user, isActionPrompt } = buildAgentPrompt({
+          userInstruction: userPrompt,
+          replyQuote: quote,
+          profile: workingProfile,
+          snapshot,
+          stepNumber: stepNum,
+          maxSteps: settings.maxSteps,
+          previousStepSummaries: previousSummaries,
+          knowledgeBlock: retrieveRelevantKnowledge(
+            knowledge,
+            `${userPrompt} ${quote || ''} ${snapshot.title} ${snapshot.headings.join(' ')}`,
+            screenshots.length > 0 ? 1200 : 1800
+          ),
+        });
+
+        const stepResult = await streamOllamaStep({
+          host: settings.ollamaHost,
+          model: modelForStep,
+          system,
+          user,
+          images: screenshots.length > 0 ? screenshots : undefined,
+          isActionPrompt,
+          signal: abortController.signal,
+          onProgress: ({ thinking, rawContent }) => {
+            currentStep.thinking = thinking;
+            if (rawContent) {
+              currentStep.summary = isActionPrompt
+                ? 'Preparing browser actions...'
+                : 'Streaming answer...';
+            }
+            syncAssistantMessage(
+              rawContent && !isActionPrompt
+                ? rawContent
+                : rawContent
+                ? 'Drafting response...'
+                : `Thinking with ${modelForStep}...`,
+              true
+            );
+          },
+        });
+
+        currentStep.thinking = stepResult.thought || currentStep.thinking;
+        currentStep.summary = stepResult.summary;
+        finalAnswer = stepResult.answer || stepResult.summary;
+
+        // Handle any `extract_to_memory` actions locally in side panel storage
+        const memoryActions = stepResult.actions.filter(
+          (a) => a.action === 'extract_to_memory' && a.field && a.value
+        );
+        const screenshotRequested = stepResult.actions.some(
+          (a) => a.action === 'screenshot'
+        );
+        const domActions = stepResult.actions.filter(
+          (a) => a.action !== 'extract_to_memory' && a.action !== 'screenshot'
+        );
+        if (screenshotRequested) {
+          forceScreenshotsNextStep = true;
+          currentStep.actions.push({
+            action: { action: 'screenshot' },
+            success: true,
+            message: 'Model requested visual screenshots for the next step.',
+          });
+        }
+
+        for (const memAct of memoryActions) {
+          const fieldKey = memAct.field as keyof PersonalProfile;
+          if (fieldKey in workingProfile) {
+            workingProfile = {
+              ...workingProfile,
+              [fieldKey]: String(memAct.value),
+            };
+            currentStep.actions.push({
+              action: memAct,
+              label: fieldKey,
+              success: true,
+              message: `Saved to Memory [${fieldKey}]: "${String(memAct.value).slice(0, 70)}"`,
+            });
+          }
+        }
+
+        if (memoryActions.length > 0) {
+          profileRef.current = workingProfile;
+          setProfile(workingProfile);
+          await saveProfile(workingProfile);
+        }
+
+        // 3. Act: Execute any browser DOM actions on the active tab
+        if (domActions.length > 0) {
+          // Enrich fill actions with the user's prompt as a fallback hint if the model omitted a reason/label
+          const enrichedDomActions = domActions.map((a) =>
+            a.action === 'fill' && !a.label && !a.reason
+              ? { ...a, reason: userPrompt }
+              : a
+          );
+          const execResult = await executeActionsOnActiveTab(enrichedDomActions, {
+            highlight: settings.highlightElements,
+            safeSubmitMode: settings.safeSubmitMode,
+          });
+
+          currentStep.actions.push(...execResult.logs);
+
+          if (execResult.pausedForSubmit) {
+            currentStep.status = 'paused_for_submit';
+            syncAssistantMessage(
+              `${finalAnswer}\n\n*(Paused before clicking final Submit button so you can review.)*`,
+              false
+            );
+            break;
+          }
+        }
+
+        currentStep.status = 'completed';
+        const actionSummaryText =
+          currentStep.actions.length > 0
+            ? `${stepResult.summary} (${currentStep.actions.map((a) => a.message).join('; ')})`
+            : stepResult.summary;
+        previousSummaries.push(actionSummaryText);
+
+        // Decide whether to finish or continue multi-step loop
+        if (
+          !screenshotRequested &&
+          (stepResult.status === 'complete' ||
+            domActions.length === 0 ||
+            domActions.some((a) => a.action === 'done'))
+        ) {
+          syncAssistantMessage(finalAnswer, false);
+          break;
+        }
+
+        syncAssistantMessage(
+          `Step ${stepNum} complete. Inspecting updated page for Step ${stepNum + 1}...`,
+          true
+        );
+        await new Promise((r) => setTimeout(r, 900));
+      }
+
+      syncAssistantMessage(
+        finalAnswer || stepsTrace[stepsTrace.length - 1]?.summary || 'Done.',
+        false
+      );
+    } catch (err: any) {
+      const isAborted = err?.name === 'AbortError';
+      if (stepsTrace.length > 0) {
+        stepsTrace[stepsTrace.length - 1].status = isAborted ? 'completed' : 'error';
+        if (isAborted && !stepsTrace[stepsTrace.length - 1].summary) {
+          stepsTrace[stepsTrace.length - 1].summary = 'Stopped by user.';
+        }
+      }
+      setMessages((prev) =>
+        prev.map((m) => {
+          if (m.id !== assistantMsgId) return m;
+          const hasMeaningfulPartial =
+            isAborted &&
+            m.content &&
+            !m.content.startsWith('Reading active webpage') &&
+            !m.content.startsWith('Capturing page screenshots') &&
+            !m.content.startsWith('Step ') &&
+            !m.content.startsWith('Thinking with ') &&
+            !m.content.startsWith('Drafting response');
+
+          return {
+            ...m,
+            content: isAborted
+              ? hasMeaningfulPartial
+                ? `${m.content}\n\n*( Generation stopped by user )*\n`
+                : '*( Generation stopped by user )*'
+              : `Error: ${err?.message || String(err)}. Make sure Ollama is running locally (${settings.ollamaHost}).`,
+            steps: [...stepsTrace],
+            isStreaming: false,
+          };
+        })
+      );
+    } finally {
+      setIsRunning(false);
+    }
+
+    // Learn in the background after the answer is shown (doesn't block the UI)
+    if (!abortController.signal.aborted) {
+      void learnFromChat(userPrompt.trim(), assistantMsgId, quote || prevAssistant);
+    }
+  };
+
+  return (
+    <div className="flex flex-col h-screen w-full bg-[#111114] text-[#F3F2EE] select-none font-sans">
+      {/* Top Navigation Bar */}
+      <header className="shrink-0 border-b border-[#24242B] bg-[#16161A]/95 backdrop-blur-md px-3.5 py-2.5 flex items-center justify-between">
+        <div className="flex items-center gap-2.5 min-w-0">
+          <div className="w-8 h-8 rounded-xl bg-gradient-to-br from-[#D97757]/25 to-[#D97757]/5 border border-[#D97757]/40 flex items-center justify-center shadow-inner shrink-0">
+            <Bot className="w-4 h-4 text-[#E5886A]" />
+          </div>
+          <div className="min-w-0">
+            <div className="flex items-center gap-1.5">
+              <span className="text-[13px] font-semibold tracking-tight text-white">
+                Any Agent
+              </span>
+              <span
+                className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[9px] font-medium border ${
+                  ollamaConnected
+                    ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/25'
+                    : 'bg-rose-500/10 text-rose-400 border-rose-500/25'
+                }`}
+                title={ollamaConnected ? 'Ollama Connected' : 'Ollama Offline'}
+              >
+                <span
+                  className={`w-1.5 h-1.5 rounded-full ${
+                    ollamaConnected ? 'bg-emerald-400' : 'bg-rose-400'
+                  }`}
+                />
+                {ollamaConnected ? 'Local' : 'Offline'}
+              </span>
+            </div>
+            <div className="text-[10px] text-[#8E8D8A] font-mono truncate max-w-[140px]">
+              {settings.selectedModel}
+            </div>
+          </div>
+        </div>
+
+        {/* Navigation Pills */}
+        <div className="flex items-center bg-[#101013] p-1 rounded-xl border border-[#25252C]">
+          <button
+            type="button"
+            onClick={() => setActiveTab('chat')}
+            className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-medium transition-all ${
+              activeTab === 'chat'
+                ? 'bg-[#26262E] text-white shadow-sm'
+                : 'text-[#8E8D8A] hover:text-white'
+            }`}
+          >
+            <MessageSquare className="w-3 h-3" />
+            Chat
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab('memory')}
+            className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-medium transition-all ${
+              activeTab === 'memory'
+                ? 'bg-[#26262E] text-white shadow-sm'
+                : 'text-[#8E8D8A] hover:text-white'
+            }`}
+          >
+            <Database className="w-3 h-3" />
+            Memory
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab('settings')}
+            className={`flex items-center px-2 py-1 rounded-lg text-[11px] font-medium transition-all ${
+              activeTab === 'settings'
+                ? 'bg-[#26262E] text-white shadow-sm'
+                : 'text-[#8E8D8A] hover:text-white'
+            }`}
+            title="Settings"
+          >
+            <Settings className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      </header>
+
+      {/* Main Content Area */}
+      <main className="flex-1 min-h-0 overflow-hidden">
+        {activeTab === 'memory' && (
+          <div className="flex flex-col h-full">
+            <div className="shrink-0 px-4 pt-3">
+              <div className="flex bg-[#141416] p-0.5 rounded-lg border border-[#2B2B30]">
+                {(['profile', 'knowledge'] as const).map((view) => (
+                  <button
+                    key={view}
+                    type="button"
+                    onClick={() => setMemoryView(view)}
+                    className={`flex-1 px-2.5 py-1 rounded-md text-[11px] font-medium transition-colors ${
+                      memoryView === view
+                        ? 'bg-[#2A2A30] text-white shadow-sm'
+                        : 'text-[#9A9893] hover:text-white'
+                    }`}
+                  >
+                    {view === 'profile'
+                      ? 'Profile'
+                      : `Knowledge${knowledge.length ? ` (${knowledge.length})` : ''}`}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="flex-1 min-h-0">
+              {memoryView === 'profile' ? (
+                <MemoryPanel profile={profile} onSave={handleSaveProfile} />
+              ) : (
+                <KnowledgePanel
+                  settings={settings}
+                  profile={profile}
+                  entries={knowledge}
+                  onSaveEntries={handleSaveKnowledge}
+                  onApplyProfile={handleSaveProfile}
+                />
+              )}
+            </div>
+          </div>
+        )}
+
+        {activeTab === 'settings' && (
+          <SettingsPanel
+            settings={settings}
+            availableModels={availableModels}
+            ollamaConnected={ollamaConnected}
+            onUpdateSettings={handleUpdateSettings}
+            onRefreshModels={() => checkOllama(settings.ollamaHost, settings.selectedModel)}
+          />
+        )}
+
+        {activeTab === 'chat' && (
+          <div className="flex flex-col h-full">
+            {/* Sub-bar for inspecting distilled DOM & Page Text */}
+            <div className="px-3.5 py-2 bg-[#141418] border-b border-[#222228] flex items-center justify-between text-[11px] text-[#8E8D8A]">
+              <button
+                type="button"
+                onClick={handleInspectDom}
+                className="flex items-center gap-1.5 hover:text-[#F3F2EE] transition-colors truncate"
+              >
+                <span className="w-4 h-4 rounded-md bg-[#D97757]/15 flex items-center justify-center shrink-0">
+                  <Eye className="w-3 h-3 text-[#D97757]" />
+                </span>
+                <span className="truncate">
+                  {lastSnapshot
+                    ? `Context: ${lastSnapshot.title.slice(0, 30)}`
+                    : 'Inspect Active Page Context'}
+                </span>
+              </button>
+              <div className="flex items-center gap-2 shrink-0">
+                {isRunning && (
+                  <button
+                    type="button"
+                    onClick={stopAgentLoop}
+                    className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-rose-500/15 hover:bg-rose-500/25 border border-rose-500/30 text-rose-300 text-[10px] font-medium transition-colors"
+                  >
+                    <Square className="w-2.5 h-2.5 fill-current" />
+                    Stop
+                  </button>
+                )}
+                {messages.length > 0 && !isRunning && (
+                  <button
+                    type="button"
+                    onClick={() => setMessages([])}
+                    className="flex items-center gap-1 text-[#7E7D7A] hover:text-rose-400 transition-colors"
+                    title="Clear conversation"
+                  >
+                    <Trash2 className="w-3 h-3" />
+                    Clear
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Collapsible Distilled Page Context Inspector */}
+            {showDomPreview && lastSnapshot && (
+              <div className="bg-[#131316] border-b border-[#2C2C32] px-3.5 py-2.5 max-h-56 overflow-y-auto space-y-2">
+                <div className="flex items-center justify-between text-[11px] text-[#A19F99]">
+                  <span className="font-semibold text-[#D97757]">
+                    Extracted Page Text ({lastSnapshot.readableText.length} chars)
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setShowDomPreview(false)}
+                    className="text-[10px] underline hover:text-white"
+                  >
+                    Hide
+                  </button>
+                </div>
+                <pre className="text-[10px] font-mono text-[#B0AFA9] whitespace-pre-wrap leading-relaxed bg-[#1A1A1E] p-2 rounded border border-[#28282E]">
+                  {lastSnapshot.readableText || 'No readable text found.'}
+                </pre>
+                <div className="text-[11px] font-semibold text-[#D97757] pt-1">
+                  Interactive Elements ({lastSnapshot.elements.length} items)
+                </div>
+                <pre className="text-[10px] font-mono text-[#B0AFA9] whitespace-pre-wrap leading-relaxed bg-[#1A1A1E] p-2 rounded border border-[#28282E]">
+                  {lastSnapshot.compactText || 'No interactive elements found.'}
+                </pre>
+              </div>
+            )}
+
+            {/* Messages Feed */}
+            <div
+              ref={chatScrollRef}
+              onMouseUp={handleChatSelection}
+              onKeyUp={handleChatSelection}
+              onScroll={() => selectionPopup && setSelectionPopup(null)}
+              className="flex-1 overflow-y-auto px-3.5 py-4 space-y-4 select-text"
+            >
+              {messages.length === 0 ? (
+                <div className="h-full flex flex-col justify-center items-center text-center px-3 space-y-5">
+                  <div className="relative">
+                    <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-[#D97757]/25 to-[#D97757]/5 border border-[#D97757]/35 flex items-center justify-center shadow-lg">
+                      <Sparkles className="w-5 h-5 text-[#E5886A]" />
+                    </div>
+                  </div>
+                  <div className="space-y-1.5">
+                    <h2 className="text-[15px] font-semibold tracking-tight text-white">
+                      How can I help with this page?
+                    </h2>
+                    <p className="text-xs text-[#8E8D8A] max-w-[260px] leading-relaxed">
+                      Summarize content, auto-fill forms from your Memory, or ask anything using your local Ollama model.
+                    </p>
+                  </div>
+
+                  {/* Quick One-Click Actions */}
+                  <div className="w-full space-y-2 pt-1">
+                    <div className="text-[10px] uppercase tracking-widest text-[#6E6D6A] font-semibold text-left px-1">
+                      Suggested Actions
+                    </div>
+                    {QUICK_PROMPTS.map((item) => {
+                      const IconComponent = item.icon;
+                      return (
+                        <button
+                          key={item.label}
+                          type="button"
+                          onClick={() => runMultiStepAgent(item.prompt)}
+                          className="group w-full text-left px-3.5 py-2.5 rounded-xl bg-[#18181D] hover:bg-[#202027] border border-[#26262E] hover:border-[#D97757]/40 text-xs text-[#E5E4E0] flex items-center gap-3 transition-all shadow-sm"
+                        >
+                          <span className="w-6 h-6 rounded-lg bg-[#D97757]/10 group-hover:bg-[#D97757]/20 border border-[#D97757]/20 flex items-center justify-center shrink-0 transition-colors">
+                            <IconComponent className="w-3.5 h-3.5 text-[#D97757]" />
+                          </span>
+                          <span className="truncate font-medium">{item.label}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              ) : (
+                messages.map((msg) => (
+                  <div
+                    key={msg.id}
+                    className={`flex flex-col ${
+                      msg.role === 'user' ? 'items-end' : 'items-start'
+                    }`}
+                  >
+                    <div
+                      className={`rounded-2xl px-3.5 py-3 text-xs leading-relaxed shadow-sm ${
+                        msg.role === 'user'
+                          ? 'max-w-[88%] bg-gradient-to-br from-[#D97757] to-[#C46445] text-white'
+                          : 'w-full bg-[#18181D] border border-[#272730] text-[#F3F2EE] space-y-2.5'
+                      }`}
+                    >
+                      {msg.steps && msg.steps.length > 0 && (
+                        <div className="space-y-2">
+                          {msg.steps.map((st) => (
+                            <StepTraceCard
+                              key={st.stepNumber}
+                              step={st}
+                              onStop={isRunning && msg.isStreaming ? stopAgentLoop : undefined}
+                            />
+                          ))}
+                        </div>
+                      )}
+                      {msg.role === 'assistant' ? (
+                        <ErrorBoundary fallbackText="Couldn't render this message as Markdown.">
+                          <MarkdownRenderer content={msg.content} />
+                        </ErrorBoundary>
+                      ) : (
+                        <>
+                          {msg.quote && (
+                            <div className="mb-1.5 pl-2 border-l-2 border-white/60 text-[11px] text-white/80 line-clamp-3 whitespace-pre-wrap break-words">
+                              {msg.quote}
+                            </div>
+                          )}
+                          <div className="whitespace-pre-wrap text-white leading-relaxed">
+                            {msg.content}
+                          </div>
+                        </>
+                      )}
+                      {msg.memoryUpdate?.status === 'pending' && (
+                        <div className="flex items-center gap-1.5 text-[10px] text-[#8E8D8A] pt-1 border-t border-[#2C2C32]">
+                          <Loader2 className="w-3 h-3 animate-spin text-[#D97757]" />
+                          Checking for anything new to remember...
+                        </div>
+                      )}
+                      {msg.memoryUpdate?.status === 'done' && (
+                        <div className="rounded-lg border border-[#D97757]/30 bg-[#D97757]/5 px-2.5 py-2 space-y-1">
+                          <div className="flex items-center justify-between">
+                            <span className="flex items-center gap-1.5 text-[11px] font-medium text-[#F3F2EE]">
+                              <Brain className="w-3 h-3 text-[#D97757]" />
+                              Memory updated
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => undoMemoryUpdate(msg.id)}
+                              className="flex items-center gap-1 text-[10px] text-[#A19F99] hover:text-white transition-colors"
+                            >
+                              <Undo2 className="w-3 h-3" />
+                              Undo
+                            </button>
+                          </div>
+                          <ul className="space-y-0.5">
+                            {msg.memoryUpdate.items.map((item, idx) => (
+                              <li key={idx} className="text-[10px] text-[#B8B7B2] break-words">
+                                • {item}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                      {msg.memoryUpdate?.status === 'undone' && (
+                        <div className="text-[10px] text-[#7E7D7A] pt-1 border-t border-[#2C2C32]">
+                          Memory change undone.
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ))
+              )}
+              <div ref={chatBottomRef} />
+            </div>
+
+            {/* Floating "Reply / Copy" bubble over highlighted chat text */}
+            {selectionPopup && (
+              <div
+                className="fixed z-50 flex items-center gap-0.5 bg-[#2A2A30] border border-[#3E3E46] rounded-lg shadow-lg p-0.5 -translate-x-1/2"
+                style={{ left: selectionPopup.x, top: selectionPopup.y }}
+                onMouseDown={(e) => e.preventDefault()} // keep the selection alive while clicking
+              >
+                <button
+                  type="button"
+                  onClick={startReplyToSelection}
+                  className="flex items-center gap-1 px-2.5 py-1 rounded-md text-[11px] font-medium text-white hover:bg-[#D97757] transition-colors"
+                >
+                  <Reply className="w-3.5 h-3.5" />
+                  Reply
+                </button>
+                <div className="w-px h-4 bg-[#3E3E46]" />
+                <button
+                  type="button"
+                  onClick={copySelection}
+                  className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] text-[#CBCAC4] hover:text-white hover:bg-[#35353C] transition-colors"
+                  title="Copy"
+                >
+                  {copiedSelection ? (
+                    <Check className="w-3.5 h-3.5 text-emerald-400" />
+                  ) : (
+                    <Copy className="w-3.5 h-3.5" />
+                  )}
+                </button>
+              </div>
+            )}
+
+            {/* Bottom Prompt Input Box */}
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                sendFromInput();
+              }}
+              className="p-3 border-t border-[#24242C] bg-[#151519]"
+            >
+              {/* Prominent Live Thinking / Writing Stop Bar */}
+              {isRunning && (
+                <div className="mb-2 flex items-center justify-between gap-2 rounded-xl bg-[#1E1E25] border border-[#32323D] px-3 py-2 shadow-sm">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span className="relative flex h-2 w-2 shrink-0">
+                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#D97757] opacity-75" />
+                      <span className="relative inline-flex rounded-full h-2 w-2 bg-[#D97757]" />
+                    </span>
+                    <span className="text-[11px] text-[#D8D7D2] truncate">
+                      {settings.selectedModel} is thinking & writing...
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={stopAgentLoop}
+                    className="shrink-0 flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 border border-rose-500/40 text-rose-200 text-[11px] font-medium transition-colors"
+                  >
+                    <Square className="w-3 h-3 fill-current" />
+                    Stop Generating
+                  </button>
+                </div>
+              )}
+
+              {replyQuote && (
+                <div className="mb-2 flex items-start gap-2 rounded-xl border-l-2 border-[#D97757] bg-[#1E1E24] px-3 py-2">
+                  <Reply className="w-3.5 h-3.5 text-[#D97757] shrink-0 mt-0.5" />
+                  <div className="flex-1 min-w-0">
+                    <div className="text-[10px] font-semibold text-[#D97757]">Replying to selection</div>
+                    <div className="text-[11px] text-[#CBCAC4] line-clamp-3 whitespace-pre-wrap break-words">
+                      {replyQuote}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setReplyQuote(null)}
+                    className="text-[#8E8D8A] hover:text-white shrink-0"
+                    title="Cancel reply"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              )}
+              <div className="relative flex items-end gap-2 bg-[#101013] border border-[#2B2B34] focus-within:border-[#D97757]/80 rounded-2xl px-3 py-2 transition-all shadow-inner">
+                <textarea
+                  ref={inputRef}
+                  rows={2}
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                      e.preventDefault();
+                      sendFromInput();
+                    } else if (e.key === 'Escape' && isRunning) {
+                      stopAgentLoop();
+                    } else if (e.key === 'Escape' && replyQuote) {
+                      setReplyQuote(null);
+                    }
+                  }}
+                  placeholder={
+                    replyQuote
+                      ? 'Ask about the highlighted part...'
+                      : 'Ask anything about this page, or tell Any Agent what to fill...'
+                  }
+                  disabled={isRunning}
+                  className="flex-1 bg-transparent text-xs text-[#F3F2EE] placeholder-[#6E6D6A] resize-none focus:outline-none leading-relaxed"
+                />
+                {isRunning ? (
+                  <button
+                    type="button"
+                    onClick={stopAgentLoop}
+                    className="shrink-0 px-2.5 py-2 rounded-xl bg-rose-500/20 hover:bg-rose-500/30 border border-rose-500/40 text-rose-200 text-[11px] font-medium flex items-center gap-1.5 transition-colors"
+                    title="Stop generation"
+                  >
+                    <Square className="w-3 h-3 fill-current" />
+                    Stop
+                  </button>
+                ) : (
+                  <button
+                    type="submit"
+                    disabled={!input.trim()}
+                    className="shrink-0 p-2 rounded-xl bg-gradient-to-br from-[#D97757] to-[#C46445] hover:from-[#E5886A] hover:to-[#D97757] disabled:opacity-35 text-white transition-all shadow-sm"
+                    title="Send prompt"
+                  >
+                    <Send className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
+            </form>
+          </div>
+        )}
+      </main>
+    </div>
+  );
+};
