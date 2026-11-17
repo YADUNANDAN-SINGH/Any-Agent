@@ -9,21 +9,16 @@ import type {
 type SearchEngine = AgentSettings['searchEngine'];
 
 const MOCK_SNAPSHOT: PageSnapshot = {
-  url: 'https://yadunandan-singh.pages.dev',
-  title: 'Yadunandan Singh — AI / Machine-Learning Engineer',
-  metaDescription: 'Portfolio and open-source work of Yadunandan Singh',
+  url: 'https://example.com',
+  title: 'Example Webpage',
+  metaDescription: 'Example page description',
   selectedText: '',
-  headings: ['Yadunandan Singh', 'AI / Machine-Learning Engineer'],
-  readableText:
-    '# Yadunandan Singh\n# AI / Machine-Learning Engineer\nI contribute to c2siorg DataLoom, mostly backend performance and data-layer work in pandas and FastAPI, and build ML systems from first principles to understand them.\n• 22 merged pull requests in c2siorg since June 2026',
+  headings: ['Welcome to Example'],
+  readableText: '# Welcome to Example\nThis is a sample webpage preview.',
   elements: [
-    { id: 1, tag: 'a', label: 'Open-source record', href: 'https://github.com/...' },
-    { id: 2, tag: 'a', label: 'Résumé' },
+    { id: 1, tag: 'a', label: 'Learn more', href: 'https://example.com/about' },
   ],
-  compactText: [
-    '[1] <a> | label="Open-source record"',
-    '[2] <a> | label="Résumé"',
-  ].join('\n'),
+  compactText: '[1] <a> | label="Learn more"',
 };
 
 export async function captureSingleViewportScreenshot(): Promise<{

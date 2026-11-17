@@ -13,12 +13,17 @@ all powered by a local [Ollama](https://ollama.com/) model. No cloud, no API key
 ![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?logo=typescript&logoColor=white)
 ![License: MIT](https://img.shields.io/badge/License-MIT-green)
 
+<br />
+
+![Any Agent Demo — Filling a Google Form Automatically](./demo/Any-Agent-Demo.gif)
+
 </div>
 
 ---
 
 ## Contents
 
+- [Demo](#any-agent)
 - [Why Any Agent](#why-any-agent)
 - [What it can do](#what-it-can-do)
 - [Quick start](#quick-start)

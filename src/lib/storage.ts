@@ -22,31 +22,28 @@ export async function saveKnowledge(entries: KnowledgeEntry[]): Promise<void> {
 }
 
 export const DEFAULT_PROFILE: PersonalProfile = {
-  fullName: 'Yadunandan Singh',
-  firstName: 'Yadunandan',
-  lastName: 'Singh',
+  fullName: '',
+  firstName: '',
+  lastName: '',
   email: '',
   phone: '',
-  location: 'India',
+  location: '',
   linkedin: '',
   github: '',
   portfolio: '',
   twitter: '',
   university: '',
-  degree: 'B.Tech',
-  major: 'Computer Science & Engineering',
-  graduationYear: '2027',
+  degree: '',
+  major: '',
+  graduationYear: '',
   gpa: '',
-  currentRole: 'Full-Stack & AI Developer',
+  currentRole: '',
   company: '',
-  skills: 'TypeScript, React, Node.js, Python, Local LLMs, Ollama, Chrome Extensions, Tailwind CSS',
-  shortBio:
-    'Passionate software engineer and AI builder focused on local-first agentic workflows, full-stack web apps, and developer tools.',
-  projectsSummary:
-    'Built Any Agent (a 100% local Chrome side-panel browser agent powered by Ollama) and multiple full-stack web & AI automation projects.',
+  skills: '',
+  shortBio: '',
+  projectsSummary: '',
   workExperience: '',
-  customNotes:
-    'When asked why I want to attend a hackathon or apply: emphasize my passion for building practical AI agents, shipping fast prototypes, and collaborating on real-world problems.',
+  customNotes: '',
 };
 
 export const DEFAULT_SETTINGS: AgentSettings = {

@@ -75,7 +75,7 @@ export const MemoryPanel: React.FC<MemoryPanelProps> = ({ profile, onSave }) => 
               type="text"
               value={draft.fullName}
               onChange={(e) => updateField('fullName', e.target.value)}
-              placeholder="Yadunandan Singh"
+              placeholder="Jane Doe"
               className={inputClass}
             />
           </div>
@@ -85,7 +85,7 @@ export const MemoryPanel: React.FC<MemoryPanelProps> = ({ profile, onSave }) => 
               type="text"
               value={draft.firstName}
               onChange={(e) => updateField('firstName', e.target.value)}
-              placeholder="Yadunandan"
+              placeholder="Jane"
               className={inputClass}
             />
           </div>
@@ -95,7 +95,7 @@ export const MemoryPanel: React.FC<MemoryPanelProps> = ({ profile, onSave }) => 
               type="text"
               value={draft.lastName}
               onChange={(e) => updateField('lastName', e.target.value)}
-              placeholder="Singh"
+              placeholder="Doe"
               className={inputClass}
             />
           </div>
@@ -105,7 +105,7 @@ export const MemoryPanel: React.FC<MemoryPanelProps> = ({ profile, onSave }) => 
               type="email"
               value={draft.email}
               onChange={(e) => updateField('email', e.target.value)}
-              placeholder="you@example.com"
+              placeholder="jane@example.com"
               className={inputClass}
             />
           </div>
@@ -115,7 +115,7 @@ export const MemoryPanel: React.FC<MemoryPanelProps> = ({ profile, onSave }) => 
               type="tel"
               value={draft.phone}
               onChange={(e) => updateField('phone', e.target.value)}
-              placeholder="+91 9876543210"
+              placeholder="+1 (555) 000-0000"
               className={inputClass}
             />
           </div>
@@ -125,7 +125,7 @@ export const MemoryPanel: React.FC<MemoryPanelProps> = ({ profile, onSave }) => 
               type="text"
               value={draft.location}
               onChange={(e) => updateField('location', e.target.value)}
-              placeholder="Bengaluru, India"
+              placeholder="San Francisco, CA"
               className={inputClass}
             />
           </div>
