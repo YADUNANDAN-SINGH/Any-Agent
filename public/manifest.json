@@ -9,6 +9,7 @@
     "tabs",
     "scripting",
     "storage",
+    "downloads",
     "declarativeNetRequest"
   ],
   "host_permissions": [

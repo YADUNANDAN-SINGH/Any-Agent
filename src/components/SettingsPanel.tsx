@@ -175,7 +175,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
             onChange={(e) => update('maxScreenshots', Number(e.target.value))}
             className="bg-[#18181B] border border-[#323236] rounded-lg px-2.5 py-1 text-xs text-[#F3F2EE] focus:outline-none focus:border-[#D97757]"
           >
-            {[1, 2, 3, 4, 5, 6, 8].map((n) => (
+            {[1, 2, 3, 4, 5, 6, 8, 10, 12].map((n) => (
               <option key={n} value={n}>
                 Up to {n} {n === 1 ? 'shot' : 'shots'}
               </option>
@@ -203,11 +203,29 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
             onChange={(e) => update('maxSteps', Number(e.target.value))}
             className="bg-[#18181B] border border-[#323236] rounded-lg px-2.5 py-1 text-xs text-[#F3F2EE] focus:outline-none focus:border-[#D97757]"
           >
-            {[1, 2, 3, 4, 5, 6, 8].map((n) => (
+            {[1, 2, 3, 4, 5, 6, 8, 10, 12].map((n) => (
               <option key={n} value={n}>
                 {n} {n === 1 ? 'step' : 'steps'}
               </option>
             ))}
+          </select>
+        </div>
+
+        <div className="flex items-center justify-between pt-2 border-t border-[#2E2E32]">
+          <div>
+            <div className="text-xs font-medium text-[#E5E4E0]">Web Search Engine</div>
+            <div className="text-[11px] text-[#9A9893]">
+              Used when the agent searches the web while surfing
+            </div>
+          </div>
+          <select
+            value={settings.searchEngine || 'google'}
+            onChange={(e) => update('searchEngine', e.target.value as AgentSettings['searchEngine'])}
+            className="bg-[#18181B] border border-[#323236] rounded-lg px-2.5 py-1 text-xs text-[#F3F2EE] focus:outline-none focus:border-[#D97757]"
+          >
+            <option value="google">Google</option>
+            <option value="duckduckgo">DuckDuckGo</option>
+            <option value="bing">Bing</option>
           </select>
         </div>
 

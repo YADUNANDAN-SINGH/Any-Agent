@@ -9,10 +9,12 @@ import {
   Save,
   Sparkles,
   Trash2,
+  Upload,
 } from 'lucide-react';
 import type { AgentSettings, KnowledgeEntry, PersonalProfile } from '../types/agent';
 import { IMPORT_PROMPT_FOR_OTHER_AI, PROFILE_FIELDS } from '../lib/knowledge';
 import { extractProfileFromText } from '../lib/ollama';
+import { parseUploadedFile } from '../lib/documentTools';
 import { MarkdownRenderer } from './MarkdownRenderer';
 
 interface KnowledgePanelProps {
@@ -23,7 +25,7 @@ interface KnowledgePanelProps {
   onApplyProfile: (profile: PersonalProfile) => Promise<void>;
 }
 
-const SOURCES = ['ChatGPT', 'Claude', 'Gemini', 'Other'];
+const SOURCES = ['ChatGPT', 'Claude', 'Gemini', 'Document', 'Other'];
 
 const makeEntry = (content: string, title: string, source: string): KnowledgeEntry => ({
   id: `kn-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
@@ -50,6 +52,28 @@ export const KnowledgePanel: React.FC<KnowledgePanelProps> = ({
   const [pending, setPending] = useState<Partial<PersonalProfile> | null>(null);
   const [selected, setSelected] = useState<Record<string, boolean>>({});
   const [expandedId, setExpandedId] = useState<string | null>(null);
+
+  const handleUploadDocToKnowledge = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    e.target.value = '';
+    if (files.length === 0) return;
+    setError('');
+    setNotice('');
+    try {
+      const parsedDocs = await Promise.all(files.map(parseUploadedFile));
+      const combinedText = parsedDocs
+        .map((d) => `# ${d.name}\n\n${d.textContent}`)
+        .join('\n\n---\n\n');
+      setSource('Document');
+      setTitle(parsedDocs.map((d) => d.name).join(', '));
+      setText((prev) => (prev ? `${prev}\n\n${combinedText}` : combinedText));
+      setNotice(
+        `Loaded ${parsedDocs.length} file(s). Click "Save + auto-fill profile" or "Save only" below.`
+      );
+    } catch (err: any) {
+      setError(`Could not read document: ${err?.message || String(err)}`);
+    }
+  };
 
   const copyPrompt = async () => {
     try {
@@ -161,18 +185,32 @@ export const KnowledgePanel: React.FC<KnowledgePanelProps> = ({
           <li>Paste it into ChatGPT, Claude or Gemini (where your history lives).</li>
           <li>Paste its answer here. It is stored only in this browser.</li>
         </ol>
-        <button
-          type="button"
-          onClick={copyPrompt}
-          className="flex items-center gap-1.5 bg-[#2B2B30] hover:bg-[#35353B] border border-[#3E3E44] text-[11px] text-[#F3F2EE] px-2.5 py-1.5 rounded-lg transition-colors"
-        >
-          {copied ? (
-            <Check className="w-3.5 h-3.5 text-emerald-400" />
-          ) : (
-            <ClipboardCopy className="w-3.5 h-3.5" />
-          )}
-          {copied ? 'Prompt copied' : 'Copy export prompt'}
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={copyPrompt}
+            className="flex items-center gap-1.5 bg-[#2B2B30] hover:bg-[#35353B] border border-[#3E3E44] text-[11px] text-[#F3F2EE] px-2.5 py-1.5 rounded-lg transition-colors"
+          >
+            {copied ? (
+              <Check className="w-3.5 h-3.5 text-emerald-400" />
+            ) : (
+              <ClipboardCopy className="w-3.5 h-3.5" />
+            )}
+            {copied ? 'Prompt copied' : 'Copy export prompt'}
+          </button>
+
+          <label className="cursor-pointer flex items-center gap-1.5 bg-[#D97757]/15 hover:bg-[#D97757]/25 border border-[#D97757]/40 text-[11px] text-[#F3F2EE] px-2.5 py-1.5 rounded-lg transition-colors">
+            <Upload className="w-3.5 h-3.5 text-[#D97757]" />
+            <span>Upload Resume / Doc (.pdf, .docx, .txt, .md)</span>
+            <input
+              type="file"
+              multiple
+              accept=".pdf,.docx,.txt,.md,.csv,.json,.html"
+              onChange={handleUploadDocToKnowledge}
+              className="hidden"
+            />
+          </label>
+        </div>
       </div>
 
       {/* Paste box */}

@@ -209,10 +209,37 @@ export async function fetchOllamaModels(host: string): Promise<OllamaModelTag[]>
   return data.models || [];
 }
 
+/** Words that only describe the PDF deliverable; they don't by themselves need the browser. */
+const PDF_DELIVERABLE_WORDS = /\b(pdf|export|download|report|document|save\s+(it|this)\s+as)\b/gi;
+
 export function isActionOrientedPrompt(prompt: string): boolean {
-  return /\b(fill|click|select|check|submit|type|enter|scroll|open|navigate|apply|register|save.*memory|extract.*memory|form|put|set|update|write.*in|paste.*in|add.*to|change.*to)\b/i.test(
-    prompt
+  const text = prompt.replace(PDF_DELIVERABLE_WORDS, ' ');
+  return /\b(fill|click|select|tick|submit|type|enter|scroll|open|navigate|surf|browse|search|google|look\s+up|go\s+to|visit|find\s+on|apply|register|sign\s+up|save.*memory|extract.*memory|form|put|set|update|write.*in|paste.*in|add.*to|change.*to|research\s+(online|on\s+the\s+web)|on\s+the\s+(web|internet)|online|latest|news|current|today'?s|www\.|https?:\/\/|[a-z0-9-]+\.(com|org|net|io|dev|ai|in|co|edu|gov)\b)/i.test(
+    text
   );
+}
+
+/**
+ * True when the user wants a PDF file built ("make a PDF of this", "export as pdf", "pdf report").
+ * Questions about an uploaded PDF ("summarize this pdf") are NOT PDF-build requests.
+ */
+export function isPdfRequestedPrompt(prompt: string): boolean {
+  const p = prompt.toLowerCase();
+  const notAboutExistingPdf = String.raw`(?<!\b(?:this|the|that|attached|uploaded|my|your|above)\s)`;
+  const patterns = [
+    /\b(?:as|into|to|in)\s+(?:a\s+|an\s+)?pdf\b/,
+    new RegExp(
+      String.raw`\b(?:build|create|generate|make|produce|prepare|compile|export|download|turn|convert|give\s+me)\b[^.?!\n]{0,60}?\b(?:a|an|new|me\s+a)\s+(?:[\w-]+\s+){0,3}` +
+        notAboutExistingPdf +
+        String.raw`pdf\b`
+    ),
+    new RegExp(
+      notAboutExistingPdf +
+        String.raw`\bpdf\s+(?:report|version|file|copy|export|summary|resume|résumé|cv|guide|handout|brochure|notes)\b`
+    ),
+    /\b(?:export|download|save)\s+(?:it|this|that|the\s+\w+)\s+(?:as\s+)?(?:a\s+)?pdf\b/,
+  ];
+  return patterns.some((re) => re.test(p));
 }
 
 export function isScreenshotRequestedPrompt(prompt: string): boolean {
@@ -226,7 +253,7 @@ export function stripDataUrlPrefix(dataUrl: string): string {
   return idx !== -1 ? dataUrl.slice(idx + 7) : dataUrl;
 }
 
-export function buildAgentPrompt(params: {
+export interface AgentPromptParams {
   userInstruction: string;
   profile: PersonalProfile;
   snapshot: PageSnapshot;
@@ -235,12 +262,40 @@ export function buildAgentPrompt(params: {
   previousStepSummaries: string[];
   knowledgeBlock?: string;
   replyQuote?: string;
-}): { system: string; user: string; isActionPrompt: boolean } {
+  uploadedDocsBlock?: string;
+  conversationBlock?: string;
+  notes?: string[];
+  pdfRequested?: boolean;
+  /** Force the action/JSON loop even if the prompt doesn't look like a browser task */
+  forceActionMode?: boolean;
+}
+
+function formatSearchResults(snapshot: PageSnapshot): string {
+  if (!snapshot.searchResults?.length) return '';
+  return snapshot.searchResults
+    .map((r, i) => `${i + 1}. ${r.title}\n   URL: ${r.url}${r.snippet ? `\n   ${r.snippet}` : ''}`)
+    .join('\n');
+}
+
+export function buildAgentPrompt(params: AgentPromptParams): {
+  system: string;
+  user: string;
+  isActionPrompt: boolean;
+} {
   const profileBlock = formatProfileForPrompt(params.profile);
   // Classify on the user's own words only (not the quoted excerpt)
-  const isActionPrompt = isActionOrientedPrompt(params.userInstruction);
+  const isActionPrompt =
+    Boolean(params.forceActionMode) ||
+    params.stepNumber > 1 ||
+    isActionOrientedPrompt(params.userInstruction);
   const quoteSection = params.replyQuote
     ? `\nTHE USER IS REPLYING TO THIS HIGHLIGHTED EXCERPT FROM THE CONVERSATION:\n"""${params.replyQuote.slice(0, 1500)}"""\nFocus your response on this excerpt and the user's message about it.\n`
+    : '';
+  const docsSection = params.uploadedDocsBlock
+    ? `\nUSER UPLOADED DOCUMENTS (the user attached these; treat them as the primary source when the request is about them):\n${params.uploadedDocsBlock}\n`
+    : '';
+  const conversationSection = params.conversationBlock
+    ? `\nRECENT CONVERSATION (for context; "it"/"that" in the request may refer to this):\n${params.conversationBlock}\n`
     : '';
   const screenshotCount = params.snapshot.screenshots?.length || 0;
   const knowledgeSection = params.knowledgeBlock
@@ -248,6 +303,9 @@ export function buildAgentPrompt(params: {
     : '';
   const personalizationRule = params.knowledgeBlock
     ? `\nPersonalize your answers using USER PERSONAL MEMORY and PERSONAL KNOWLEDGE (their background, projects, goals, tone and preferences). Speak to the user as someone who knows them, but never invent facts that aren't there.`
+    : '';
+  const pageState = params.snapshot.restricted
+    ? `\nNOTE: The current tab (${params.snapshot.url || 'new tab'}) is a browser-internal or unreadable page with no content. Use "navigate" or "search_web" to get information from the web.\n`
     : '';
 
   if (!isActionPrompt) {
@@ -260,14 +318,17 @@ export function buildAgentPrompt(params: {
         ? `\nNOTE: ${screenshotCount} screenshot(s) of the webpage have been attached because the DOM text was unavailable/sparse or visual inspection was requested. Carefully read all text, UI elements, charts, and details visible in the attached screenshot image(s) to answer the user's request.\n`
         : '';
 
+    const taskRule = params.pdfRequested
+      ? `The user wants a PDF document. Write the COMPLETE document in Markdown: start with "# <Title>", then well-organized "##" sections, bullet points, and tables where useful. Be thorough and specific, using the uploaded documents, webpage and memory below. Output ONLY the document itself — no preamble like "Here is", no closing remarks. The app converts your Markdown into the PDF.`
+      : `Answer the user's request clearly and concisely using Markdown (bullet points, bold headings, key takeaways) based on the uploaded documents, the active webpage content and/or attached screenshots.`;
+
     const system = `You are "Any Agent", a helpful, fast local browser assistant running inside Chrome.
-Answer the user's request clearly and concisely using Markdown (bullet points, bold headings, key takeaways) based on the active webpage content and/or attached page screenshots.
+${taskRule}
 Keep your <think> reasoning brief and focused so you can respond quickly.${personalizationRule}`;
 
-    const user = `USER REQUEST:
-"${params.userInstruction}"
-${quoteSection}${screenshotNote}
-ACTIVE WEBPAGE:
+    const webpageBlock = params.snapshot.restricted
+      ? `ACTIVE WEBPAGE: (none — the current tab is a new tab / browser page)`
+      : `ACTIVE WEBPAGE:
 Title: ${params.snapshot.title}
 URL: ${params.snapshot.url}
 Meta Description: ${params.snapshot.metaDescription || 'None'}
@@ -275,11 +336,16 @@ Headings: ${params.snapshot.headings.join(' | ') || 'None'}
 ${selectedBlock}
 WEBPAGE DOM TEXT:
 ${
-  params.snapshot.readableText ||
+  params.snapshot.readableText.slice(0, params.uploadedDocsBlock ? 3000 : 9000) ||
   (screenshotCount > 0
     ? `(DOM text could not be extracted; rely on the ${screenshotCount} attached screenshot(s) of the page.)`
     : '(No main text extracted)')
-}
+}`;
+
+    const user = `USER REQUEST:
+"${params.userInstruction}"
+${quoteSection}${conversationSection}${docsSection}${screenshotNote}
+${webpageBlock}
 
 USER PERSONAL MEMORY (if relevant):
 ${profileBlock || '(None)'}
@@ -292,62 +358,178 @@ ${knowledgeSection}`;
     params.previousStepSummaries.length > 0
       ? params.previousStepSummaries.map((s, idx) => `Step ${idx + 1}: ${s}`).join('\n')
       : 'None (this is Step 1)';
+  const notesBlock = params.notes?.length ? params.notes.map((n) => `- ${n}`).join('\n') : '(none yet)';
+  const isFinalStep = params.stepNumber >= params.maxSteps;
+  const searchResultsBlock = formatSearchResults(params.snapshot);
 
-  const system = `You are "Any Agent", a local Chrome browser automation agent.
+  const system = `You are "Any Agent", a local Chrome browser automation agent. You control the user's current tab: you can fill forms, click, and SURF THE WEB (search, open results, follow links, go back) step by step. After each step you'll see the new page.
 Keep your <think> reasoning short and direct.${personalizationRule}
 Output valid JSON at the end of your response matching this schema:
 \`\`\`json
 {
-  "answer": "Clear markdown summary of what you did or found on the page.",
-  "summary": "Short 1-line status",
-  "status": "complete",
+  "answer": "Markdown answer for the user (the full final answer when status is complete; a short progress note otherwise).",
+  "summary": "Short 1-line status of this step",
+  "notes": "Key facts/data from THIS page that help answer the request (names, numbers, prices, dates + source URL). Empty string if none.",
+  "status": "continue",
   "actions": [
-    { "id": 5, "label": "Twitter", "action": "fill", "value": "yadunandan077" }
+    { "action": "search_web", "value": "best budget laptops 2026" }
   ]
 }
 \`\`\`
-
-CRITICAL RULES FOR FORM FILLING:
-1. Look carefully at the exact [id] number next to each <input:...>, <textarea>, or <select> in "INTERACTIVE ELEMENTS ON PAGE". Never use the example id (1) unless [1] is actually the target field!
-2. Always include "label" in each fill/select action with the target field's name (e.g., "label": "Twitter").
-3. Do NOT emit "click" actions on random navigation links unless the user explicitly asked to click a link or button.
-4. If a social field expects a username/handle (like @username), provide just the username without https://.
 
 ALLOWED ACTIONS:
 - { "id": 5, "label": "Field Label", "action": "fill", "value": "text" }
 - { "id": 6, "label": "Field Label", "action": "select", "value": "option text" }
 - { "id": 7, "label": "Field Label", "action": "check", "value": true }
-- { "id": 8, "label": "Button Label", "action": "click", "reason": "Clicking button/link" }
-- { "action": "scroll", "value": "down" }
-- { "action": "screenshot", "reason": "Capture visual screenshots of the page" }
-- { "action": "navigate", "value": "https://..." }
+- { "id": 8, "label": "Button/Link Label", "action": "click" }
+- { "id": 9, "label": "Search Input", "action": "press_enter", "value": "optional text to type first" }
+- { "action": "scroll", "value": "down" } (or "up")
+- { "action": "navigate", "value": "https://example.com" } (open any URL or domain in the current tab)
+- { "action": "search_web", "value": "search query" } (run a web search in the current tab)
+- { "action": "open_result", "value": 2 } (open search result number 2 from SEARCH RESULTS)
+- { "action": "go_back" }
+- { "action": "screenshot" } (capture the page visually on the next step)
+- { "action": "generate_pdf", "title": "Document Title", "filename": "document-title.pdf" } (build a downloadable PDF; the full document is written from your notes afterwards, so content is optional)
 - { "action": "extract_to_memory", "field": "projectsSummary", "value": "Extracted details..." } (Allowed fields: fullName, email, phone, location, linkedin, github, portfolio, twitter, university, degree, major, graduationYear, gpa, currentRole, company, skills, shortBio, projectsSummary, workExperience, customNotes)
-- Set "status": "continue" ONLY if you clicked a button/link, requested a "screenshot", or scrolled and need another step to inspect the updated page. Otherwise set "status": "complete".`;
+
+WEB SURFING RULES:
+1. If the user asks to look something up, research, find, compare, or visit a site, use the browser; don't answer from memory.
+2. Typical flow: search_web -> open_result N (most relevant result) -> read the page -> (optionally go_back / open another) -> answer.
+3. Use at most ONE navigation action (navigate, search_web, open_result, go_back, or a link click) per step, and put it LAST in "actions". You'll see the new page in the next step.
+4. Record what you learn on each page in "notes" — earlier pages are not shown again, only your notes.
+5. Set "status": "continue" while you still need to visit or interact with pages. Set "status": "complete" with the full final "answer" once you have enough information.
+
+FORM RULES:
+1. Use the exact [id] number of the target element from INTERACTIVE ELEMENTS ON PAGE. Never invent ids.
+2. Always include "label" in fill/select actions with the field's name.
+3. Don't click random navigation links unless it helps the user's request.
+4. If a social field expects a username/handle (like @username), provide just the username without https://.${
+    params.pdfRequested
+      ? `\n\nTHE USER WANTS A PDF: first gather what's needed (browse if the request requires it). When you have enough, include a "generate_pdf" action with a good title and set "status": "complete".`
+      : ''
+  }${
+    isFinalStep
+      ? `\n\nTHIS IS THE FINAL STEP: do NOT navigate anymore. Set "status": "complete" and write the best complete "answer" you can from NOTES GATHERED SO FAR and the current page.`
+      : ''
+  }`;
+
+  const pageContent = searchResultsBlock
+    ? `SEARCH RESULTS (open one with {"action":"open_result","value":N}):\n${searchResultsBlock}`
+    : `READABLE PAGE CONTENT:\n${
+        params.snapshot.readableText.slice(0, params.uploadedDocsBlock ? 3000 : 5500) ||
+        (screenshotCount > 0
+          ? '(See attached screenshots)'
+          : '(None - emit a "screenshot" action if the page is visual, or navigate elsewhere)')
+      }`;
 
   const user = `USER REQUEST:
 "${params.userInstruction}"
-${quoteSection}
+${quoteSection}${conversationSection}
 USER PERSONAL MEMORY:
 ${profileBlock || '(No profile fields set yet)'}
-${knowledgeSection}
-PREVIOUS STEPS (Step ${params.stepNumber} of ${params.maxSteps}):
+${knowledgeSection}${docsSection}
+PREVIOUS STEPS (now on step ${params.stepNumber} of ${params.maxSteps}):
 ${historyBlock}
 
+NOTES GATHERED SO FAR:
+${notesBlock}
+${pageState}
 CURRENT WEBPAGE:
 Title: ${params.snapshot.title}
 URL: ${params.snapshot.url}
-Headings: ${params.snapshot.headings.join(' | ') || 'None'}
+Headings: ${params.snapshot.headings.slice(0, 15).join(' | ') || 'None'}
 Attached Screenshots: ${screenshotCount}
 
-READABLE PAGE CONTENT:
-${params.snapshot.readableText.slice(0, 2200) || '(None - see attached screenshots if present, or emit a "screenshot" action)'}
+${pageContent}
 
 INTERACTIVE ELEMENTS ON PAGE:
-${params.snapshot.compactText || '(No interactive elements detected)'}
+${params.snapshot.compactText.slice(0, 6000) || '(No interactive elements detected)'}
 
 Return your JSON response now:`;
 
   return { system, user, isActionPrompt: true };
+}
+
+/**
+ * Prompt for the dedicated "write the PDF document" pass. Plain Markdown output (no JSON),
+ * which small local models handle far more reliably than a huge JSON string.
+ */
+export function buildDocumentWriterPrompt(params: {
+  userInstruction: string;
+  title?: string;
+  notes: string[];
+  draftAnswer?: string;
+  snapshot?: PageSnapshot | null;
+  uploadedDocsBlock?: string;
+  conversationBlock?: string;
+  profile: PersonalProfile;
+  knowledgeBlock?: string;
+}): { system: string; user: string } {
+  const profileBlock = formatProfileForPrompt(params.profile);
+  const system = `You are "Any Agent", writing a document that will be converted directly into a PDF.
+Write the COMPLETE document in Markdown:
+- Start with "# ${params.title || '<Title>'}"
+- Use "##" sections, short paragraphs, bullet points, and Markdown tables where useful
+- Be specific: include the concrete facts, numbers, names and sources from the material below
+- Never invent facts that are not in the material or the user's memory
+Output ONLY the document — no preamble ("Here is..."), no closing remarks, no JSON.`;
+
+  const page =
+    params.snapshot && !params.snapshot.restricted && params.snapshot.readableText
+      ? `\nCURRENT WEBPAGE: ${params.snapshot.title} (${params.snapshot.url})\n${params.snapshot.readableText.slice(0, 6000)}\n`
+      : '';
+
+  const user = `USER REQUEST:
+"${params.userInstruction}"
+${params.conversationBlock ? `\nRECENT CONVERSATION:\n${params.conversationBlock}\n` : ''}${
+    params.notes.length
+      ? `\nRESEARCH NOTES GATHERED WHILE BROWSING:\n${params.notes.map((n) => `- ${n}`).join('\n')}\n`
+      : ''
+  }${params.draftAnswer ? `\nDRAFT ANSWER FROM THE BROWSING AGENT:\n${params.draftAnswer.slice(0, 4000)}\n` : ''}${
+    params.uploadedDocsBlock ? `\nUSER UPLOADED DOCUMENTS:\n${params.uploadedDocsBlock}\n` : ''
+  }${page}
+USER PERSONAL MEMORY (use if relevant, e.g. for a resume or cover letter):
+${profileBlock || '(None)'}
+${params.knowledgeBlock ? `\nPERSONAL KNOWLEDGE:\n${params.knowledgeBlock}\n` : ''}
+Write the full Markdown document now:`;
+
+  return { system, user };
+}
+
+/** Repairs the most common JSON mistakes small models make (raw newlines in strings, trailing commas). */
+function parseJsonLoose(text: string): any {
+  try {
+    return JSON.parse(text);
+  } catch {
+    // fall through to repair
+  }
+  let out = '';
+  let inString = false;
+  let escaped = false;
+  for (const ch of text) {
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+        out += ch;
+      } else if (ch === '\\') {
+        escaped = true;
+        out += ch;
+      } else if (ch === '"') {
+        inString = false;
+        out += ch;
+      } else if (ch === '\n') {
+        out += '\\n';
+      } else if (ch === '\t') {
+        out += '\\t';
+      } else if (ch !== '\r') {
+        out += ch;
+      }
+    } else {
+      if (ch === '"') inString = true;
+      out += ch;
+    }
+  }
+  return JSON.parse(out.replace(/,\s*([}\]])/g, '$1'));
 }
 
 export function extractThinkingAndJson(rawText: string): {
@@ -397,16 +579,25 @@ export function parseAgentStepJson(
   if (firstBrace !== -1 && lastBrace > firstBrace) {
     const slice = jsonSource.slice(firstBrace, lastBrace + 1);
     try {
-      const parsed = JSON.parse(slice);
-      const actions = Array.isArray(parsed.actions) ? parsed.actions : [];
+      const parsed = parseJsonLoose(slice);
+      const rawActions = Array.isArray(parsed.actions) ? parsed.actions : parsed.action ? [parsed] : [];
+      const actions = rawActions
+        .filter((a: any) => a && typeof a === 'object' && typeof a.action === 'string')
+        .map((a: any) => ({ ...a, action: String(a.action).toLowerCase().trim() }));
       const answer =
         parsed.answer ||
         parsed.response ||
         parsed.summary ||
         (actions.length > 0 ? `Executed ${actions.length} browser action(s).` : '');
+      const notes = Array.isArray(parsed.notes)
+        ? parsed.notes.map(String).join('; ')
+        : typeof parsed.notes === 'string'
+        ? parsed.notes
+        : '';
       return {
         thought: thinking,
-        answer,
+        answer: String(answer),
+        notes: notes.trim() || undefined,
         summary: parsed.summary || 'Completed step.',
         actions,
         status: parsed.status === 'continue' ? 'continue' : 'complete',
@@ -421,7 +612,7 @@ export function parseAgentStepJson(
   if (firstBracket !== -1 && lastBracket > firstBracket) {
     const slice = jsonSource.slice(firstBracket, lastBracket + 1);
     try {
-      const arr = JSON.parse(slice);
+      const arr = parseJsonLoose(slice);
       if (Array.isArray(arr)) {
         return {
           thought: thinking,
@@ -436,7 +627,11 @@ export function parseAgentStepJson(
     }
   }
 
-  const fallbackText = cleanContent.trim() || 'Done.';
+  // Last resort: salvage the "answer" field from broken JSON instead of showing raw JSON to the user
+  const answerMatch = candidate.match(/"answer"\s*:\s*"((?:\\.|[^"\\])*)"/);
+  const fallbackText = answerMatch
+    ? answerMatch[1].replace(/\\n/g, '\n').replace(/\\"/g, '"')
+    : cleanContent.replace(/```(?:json)?[\s\S]*?```/g, '').trim() || 'Done.';
   return {
     thought: thinking,
     answer: fallbackText,
@@ -454,6 +649,8 @@ export async function streamOllamaStep(params: {
   images?: string[]; // Raw base64 strings or data URLs
   isActionPrompt: boolean;
   signal?: AbortSignal;
+  temperature?: number;
+  numPredictReserve?: number;
   onProgress: (state: { thinking: string; rawContent: string }) => void;
 }): Promise<AgentStepResult> {
   const cleanHost = params.host.replace(/\/+$/, '');
@@ -470,6 +667,13 @@ export async function streamOllamaStep(params: {
     userMessage.images = base64Images;
   }
 
+  // Size the context window to the prompt: Ollama silently truncates the START of the prompt
+  // (the system rules!) when it doesn't fit, which breaks document Q&A and JSON actions.
+  const promptTokens = Math.ceil((params.system.length + params.user.length) / 3.2);
+  const imageTokens = (base64Images?.length || 0) * 1000;
+  const wanted = promptTokens + imageTokens + (params.numPredictReserve ?? 3072);
+  const numCtx = Math.min(32768, Math.max(8192, Math.ceil(wanted / 4096) * 4096));
+
   const response = await fetch(`${cleanHost}/api/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -478,8 +682,8 @@ export async function streamOllamaStep(params: {
       model: params.model,
       stream: true,
       options: {
-        temperature: 0.25,
-        num_ctx: 8192,
+        temperature: params.temperature ?? 0.25,
+        num_ctx: numCtx,
       },
       messages: [
         { role: 'system', content: params.system },

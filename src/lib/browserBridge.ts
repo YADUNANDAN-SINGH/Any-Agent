@@ -1,8 +1,12 @@
 import type {
   ActionExecutionLog,
   AgentAction,
+  AgentSettings,
   PageSnapshot,
+  SearchResult,
 } from '../types/agent';
+
+type SearchEngine = AgentSettings['searchEngine'];
 
 const MOCK_SNAPSHOT: PageSnapshot = {
   url: 'https://yadunandan-singh.pages.dev',
@@ -127,6 +131,12 @@ export async function getActivePageSnapshot(options?: {
       type: 'ENSURE_CONTENT_SCRIPT',
     });
 
+    // New tab / chrome:// pages can't be read or screenshotted. That's fine: the agent can still
+    // answer from uploaded documents, or navigate somewhere else.
+    if (ensureResp?.restricted) {
+      return emptySnapshot(ensureResp.url || '', ensureResp.title || 'New Tab', { restricted: true });
+    }
+
     if (ensureResp?.ok && typeof ensureResp.tabId === 'number') {
       const okTabId: number = ensureResp.tabId;
       tabId = okTabId;
@@ -168,21 +178,62 @@ export async function getActivePageSnapshot(options?: {
         screenshots: captured.screenshots,
         usedScreenshotFallback: true,
       };
-    } catch (shotErr: any) {
+    } catch {
       if (domSnapshot) return domSnapshot;
-      throw new Error(
-        shotErr?.message ||
-          'Could not read DOM or capture screenshots from this tab.'
-      );
+      const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []);
+      return emptySnapshot(tab?.url || '', tab?.title || 'Unreadable page', { restricted: true });
     }
   }
 
-  return domSnapshot!;
+  if (domSnapshot) return domSnapshot;
+  const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []);
+  return emptySnapshot(tab?.url || '', tab?.title || 'Unreadable page', { restricted: true });
+}
+
+function emptySnapshot(url: string, title: string, extra: Partial<PageSnapshot> = {}): PageSnapshot {
+  return {
+    url,
+    title,
+    metaDescription: '',
+    selectedText: '',
+    headings: [],
+    readableText: '',
+    elements: [],
+    compactText: '',
+    ...extra,
+  };
+}
+
+const SEARCH_URLS: Record<SearchEngine, string> = {
+  google: 'https://www.google.com/search?q=',
+  duckduckgo: 'https://duckduckgo.com/?q=',
+  bing: 'https://www.bing.com/search?q=',
+};
+
+export function buildSearchUrl(query: string, engine: SearchEngine = 'google'): string {
+  return `${SEARCH_URLS[engine] || SEARCH_URLS.google}${encodeURIComponent(query.trim())}`;
+}
+
+/** Turns whatever the model wrote ("example.com", "https://..", "best laptops 2026") into a URL. */
+export function resolveNavigationTarget(raw: string, engine: SearchEngine = 'google'): string {
+  const value = raw.trim().replace(/^["'<]+|["'>.,;]+$/g, '');
+  if (/^https?:\/\//i.test(value)) return value;
+  if (/^(localhost|127\.0\.0\.1)(:\d+)?(\/|$)/i.test(value)) return `http://${value}`;
+  // Looks like a bare domain: no spaces and a dot followed by a TLD
+  if (!/\s/.test(value) && /^[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,}(:\d+)?(\/\S*)?$/i.test(value)) {
+    return `https://${value}`;
+  }
+  return buildSearchUrl(value, engine);
 }
 
 export async function executeActionsOnActiveTab(
   actions: AgentAction[],
-  options: { highlight: boolean; safeSubmitMode: boolean }
+  options: {
+    highlight: boolean;
+    safeSubmitMode: boolean;
+    searchEngine?: SearchEngine;
+    searchResults?: SearchResult[];
+  }
 ): Promise<{ logs: ActionExecutionLog[]; pausedForSubmit: boolean }> {
   if (typeof chrome === 'undefined' || !chrome.runtime?.sendMessage) {
     return {
@@ -195,26 +246,135 @@ export async function executeActionsOnActiveTab(
     };
   }
 
-  const ensureResp = await chrome.runtime.sendMessage({
-    type: 'ENSURE_CONTENT_SCRIPT',
-  });
-  if (!ensureResp?.ok || typeof ensureResp.tabId !== 'number') {
-    throw new Error(ensureResp?.error || 'Unable to connect to active browser tab.');
+  const allLogs: ActionExecutionLog[] = [];
+  let pausedForSubmit = false;
+  const domBatch: AgentAction[] = [];
+
+  const flushDomBatch = async () => {
+    if (domBatch.length === 0) return;
+    const toRun = [...domBatch];
+    domBatch.length = 0;
+
+    const ensureResp = await chrome.runtime.sendMessage({
+      type: 'ENSURE_CONTENT_SCRIPT',
+    });
+    if (!ensureResp?.ok || typeof ensureResp.tabId !== 'number') {
+      allLogs.push({
+        action: toRun[0],
+        success: false,
+        message: ensureResp?.error || 'Unable to connect to active browser tab.',
+      });
+      return;
+    }
+
+    try {
+      const resp = await chrome.tabs.sendMessage(ensureResp.tabId, {
+        type: 'EXECUTE_ACTIONS',
+        actions: toRun,
+        highlight: options.highlight,
+        safeSubmitMode: options.safeSubmitMode,
+      });
+
+      if (resp?.ok) {
+        allLogs.push(...(resp.logs || []));
+        if (resp.pausedForSubmit) pausedForSubmit = true;
+      } else {
+        allLogs.push({
+          action: toRun[0],
+          success: false,
+          message: resp?.error || 'Action execution failed.',
+        });
+      }
+    } catch {
+      // Content script context may have unloaded right as a link click navigated the tab!
+      await chrome.runtime.sendMessage({ type: 'WAIT_FOR_TAB_SETTLE', graceMs: 1200, timeoutMs: 15000 });
+      allLogs.push({
+        action: toRun[toRun.length - 1],
+        success: true,
+        message: 'Clicked element and navigated to new page.',
+      });
+    }
+  };
+
+  const navigateTo = async (act: AgentAction, targetUrl: string, okMessage: string) => {
+    const navResp = await chrome.runtime.sendMessage({
+      type: 'NAVIGATE_ACTIVE_TAB',
+      url: targetUrl,
+    });
+    allLogs.push({
+      action: act,
+      success: Boolean(navResp?.ok),
+      message: navResp?.ok
+        ? okMessage
+        : `Failed to open ${targetUrl}: ${navResp?.error || 'unknown error'}`,
+    });
+  };
+
+  for (const act of actions) {
+    if (act.action === 'navigate' || act.action === 'search_web') {
+      await flushDomBatch();
+      const rawVal = String(act.url || act.value || '').trim();
+      if (!rawVal) {
+        allLogs.push({ action: act, success: false, message: `${act.action} needs a URL or query.` });
+        continue;
+      }
+      const targetUrl =
+        act.action === 'search_web'
+          ? buildSearchUrl(rawVal, options.searchEngine)
+          : resolveNavigationTarget(rawVal, options.searchEngine);
+      await navigateTo(
+        act,
+        targetUrl,
+        act.action === 'search_web' ? `Searched the web for "${rawVal}"` : `Opened ${targetUrl}`
+      );
+      continue;
+    }
+
+    if (act.action === 'open_result') {
+      await flushDomBatch();
+      const results = options.searchResults || [];
+      const raw = String(act.url || (act.value ?? act.id ?? '')).trim();
+      const n = Number(raw.replace(/[^\d]/g, ''));
+      const byIndex = Number.isInteger(n) && n >= 1 && n <= results.length ? results[n - 1] : undefined;
+      const byUrl = /^https?:\/\//i.test(raw) ? { title: raw, url: raw } : undefined;
+      const target = byUrl || byIndex;
+      if (!target) {
+        allLogs.push({
+          action: act,
+          success: false,
+          message: `Search result "${raw}" not found (${results.length} results on page).`,
+        });
+        continue;
+      }
+      await navigateTo(act, target.url, `Opened result: ${target.title.slice(0, 80)}`);
+      continue;
+    }
+
+    if (act.action === 'go_back') {
+      await flushDomBatch();
+      const backResp = await chrome.runtime.sendMessage({
+        type: 'GO_BACK_ACTIVE_TAB',
+      });
+      allLogs.push({
+        action: act,
+        success: Boolean(backResp?.ok),
+        message: backResp?.ok ? 'Navigated back to previous page' : 'Could not go back',
+      });
+      continue;
+    }
+
+    domBatch.push(act);
   }
 
-  const resp = await chrome.tabs.sendMessage(ensureResp.tabId, {
-    type: 'EXECUTE_ACTIONS',
-    actions,
-    highlight: options.highlight,
-    safeSubmitMode: options.safeSubmitMode,
-  });
+  await flushDomBatch();
 
-  if (!resp?.ok) {
-    throw new Error(resp?.error || 'Failed to execute actions on page.');
+  // If any click action was executed, wait briefly in case the click triggered a page load
+  if (actions.some((a) => a.action === 'click' || a.action === 'press_enter')) {
+    await chrome.runtime.sendMessage({ type: 'WAIT_FOR_TAB_SETTLE', graceMs: 1200, timeoutMs: 15000 });
   }
 
   return {
-    logs: resp.logs || [],
-    pausedForSubmit: Boolean(resp.pausedForSubmit),
+    logs: allLogs,
+    pausedForSubmit,
   };
 }

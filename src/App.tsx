@@ -42,15 +42,42 @@ import {
   withLearnedFacts,
 } from './lib/knowledge';
 import { extractMemoryUpdatesFromChat } from './lib/ollama';
-import { Brain, Check, Copy, Loader2, Reply, Undo2, X } from 'lucide-react';
+import {
+  Brain,
+  Check,
+  Copy,
+  Download,
+  FileDown,
+  Globe,
+  Loader2,
+  Paperclip,
+  Reply,
+  Undo2,
+  X,
+} from 'lucide-react';
 import { KnowledgePanel } from './components/KnowledgePanel';
-import type { KnowledgeEntry, MemoryUpdateInfo } from './types/agent';
+import type {
+  AgentAction,
+  GeneratedPdfDoc,
+  KnowledgeEntry,
+  MemoryUpdateInfo,
+  UploadedDocument,
+} from './types/agent';
 import {
   buildAgentPrompt,
+  buildDocumentWriterPrompt,
   fetchOllamaModels,
+  isPdfRequestedPrompt,
+  isScreenshotRequestedPrompt,
   streamOllamaStep,
   type OllamaModelTag,
 } from './lib/ollama';
+import {
+  UPLOAD_ACCEPT,
+  downloadGeneratedPdf,
+  parseUploadedFile,
+  previewGeneratedPdf,
+} from './lib/documentTools';
 import {
   executeActionsOnActiveTab,
   getActivePageSnapshot,
@@ -60,7 +87,6 @@ import { SettingsPanel } from './components/SettingsPanel';
 import { StepTraceCard } from './components/StepTraceCard';
 import { MarkdownRenderer } from './components/MarkdownRenderer';
 import { ErrorBoundary } from './components/ErrorBoundary';
-import { isScreenshotRequestedPrompt } from './lib/ollama';
 
 type ActiveTab = 'chat' | 'memory' | 'settings';
 
@@ -72,10 +98,10 @@ const QUICK_PROMPTS = [
     icon: FileText,
   },
   {
-    label: 'Save my details from this page into Memory',
+    label: 'Build a downloadable PDF from this page',
     prompt:
-      'Read this webpage and extract any relevant personal profile info (bio, projects, links, skills, role, education) into my Personal Memory using extract_to_memory actions, and summarize what you found.',
-    icon: BookmarkPlus,
+      'Create a well-structured PDF report of this webpage with an overview, key points and takeaways.',
+    icon: FileDown,
   },
   {
     label: 'Fill out form on this page using Memory',
@@ -83,10 +109,10 @@ const QUICK_PROMPTS = [
     icon: Wand2,
   },
   {
-    label: 'What actions or links are on this page?',
+    label: 'Save my details from this page into Memory',
     prompt:
-      'Analyze this page and tell me what interactive buttons, links, or forms are available and what they do.',
-    icon: MousePointerClick,
+      'Read this webpage and extract any relevant personal profile info (bio, projects, links, skills, role, education) into my Personal Memory using extract_to_memory actions, and summarize what you found.',
+    icon: BookmarkPlus,
   },
 ];
 
@@ -134,6 +160,38 @@ export const App: React.FC = () => {
     y: number;
   } | null>(null);
   const [copiedSelection, setCopiedSelection] = useState(false);
+
+  // ----- Document Uploads in Chat -----
+  const [attachedDocs, setAttachedDocs] = useState<UploadedDocument[]>([]);
+  const [parsingFiles, setParsingFiles] = useState<string[]>([]);
+  const [attachError, setAttachError] = useState('');
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  const attachFiles = async (files: File[]) => {
+    if (files.length === 0) return;
+    setAttachError('');
+    setParsingFiles((prev) => [...prev, ...files.map((f) => f.name)]);
+    const results = await Promise.allSettled(files.map(parseUploadedFile));
+    const ok = results
+      .filter((r): r is PromiseFulfilledResult<UploadedDocument> => r.status === 'fulfilled')
+      .map((r) => r.value);
+    const failed = results
+      .map((r, i) => (r.status === 'rejected' ? `${files[i].name}: ${r.reason?.message || r.reason}` : ''))
+      .filter(Boolean);
+    setAttachedDocs((prev) => [...prev, ...ok]);
+    setParsingFiles((prev) => prev.filter((n) => !files.some((f) => f.name === n)));
+    if (failed.length) setAttachError(`Couldn't read ${failed.join('; ')}`);
+  };
+
+  const handleAttachFiles = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    e.target.value = '';
+    await attachFiles(files);
+  };
+
+  const removeAttachedDoc = (id: string) => {
+    setAttachedDocs((prev) => prev.filter((d) => d.id !== id));
+  };
 
   const handleChatSelection = () => {
     // Defer so the browser has finalized the selection
@@ -185,10 +243,15 @@ export const App: React.FC = () => {
   };
 
   const sendFromInput = () => {
-    if (!input.trim() || isRunning) return;
+    if ((!input.trim() && attachedDocs.length === 0) || isRunning || parsingFiles.length > 0) return;
     const quote = replyQuote || undefined;
+    const docsToSend = attachedDocs.length > 0 ? [...attachedDocs] : undefined;
+    const promptText =
+      input.trim() ||
+      `Analyze the attached document(s) (${attachedDocs.map((d) => d.name).join(', ')}) and summarize the key points.`;
     setReplyQuote(null);
-    runMultiStepAgent(input, quote);
+    setAttachedDocs([]);
+    runMultiStepAgent(promptText, quote, docsToSend);
   };
 
   useEffect(() => {
@@ -377,7 +440,11 @@ export const App: React.FC = () => {
     setIsRunning(false);
   };
 
-  const runMultiStepAgent = async (userPrompt: string, quote?: string) => {
+  const runMultiStepAgent = async (
+    userPrompt: string,
+    quote?: string,
+    attachments?: UploadedDocument[]
+  ) => {
     if (!userPrompt.trim() || isRunning) return;
 
     const prevAssistant =
@@ -388,6 +455,7 @@ export const App: React.FC = () => {
       role: 'user',
       content: userPrompt.trim(),
       quote,
+      attachments,
       timestamp: Date.now(),
     };
 
@@ -410,9 +478,53 @@ export const App: React.FC = () => {
 
     const stepsTrace: StepTrace[] = [];
     const previousSummaries: string[] = [];
+    const gatheredNotes: string[] = [];
     let workingProfile = { ...profile };
+    let latestPdf: GeneratedPdfDoc | undefined;
+    let lastSnapshotSeen: PageSnapshot | null = null;
 
-    const syncAssistantMessage = (content: string, isStreaming: boolean) => {
+    // Documents stay available for follow-ups ("now turn it into a PDF"): this prompt's
+    // attachments plus the most recent ones from earlier in the conversation.
+    const activeDocs: UploadedDocument[] = [];
+    for (const d of [
+      ...(attachments || []),
+      ...[...messages].reverse().flatMap((m) => m.attachments || []),
+    ]) {
+      if (!activeDocs.some((x) => x.id === d.id) && activeDocs.length < 3) activeDocs.push(d);
+    }
+
+    const DOC_CHAR_BUDGET = 24000;
+    const uploadedDocsBlock =
+      activeDocs.length > 0
+        ? activeDocs
+            .map((d) => {
+              const share = Math.floor(DOC_CHAR_BUDGET / activeDocs.length);
+              const body = d.textContent.slice(0, share);
+              const cut = d.textContent.length > share ? '\n[...document truncated...]' : '';
+              const isNew = attachments?.some((a) => a.id === d.id);
+              return `--- DOCUMENT: "${d.name}" (${Math.round(d.size / 1024)} KB${
+                d.pageCount ? `, ${d.pageCount} pages` : ''
+              }${isNew ? ', attached to this message' : ', attached earlier'}) ---\n${body}${cut}`;
+            })
+            .join('\n\n')
+        : undefined;
+
+    const uploadedImages = activeDocs
+      .flatMap((d) => [d.imageDataUrl, ...(d.pageImages || [])])
+      .filter((u): u is string => Boolean(u))
+      .slice(0, 4);
+
+    const conversationBlock =
+      messages
+        .slice(-4)
+        .map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content.slice(0, 1200)}`)
+        .join('\n\n') || undefined;
+
+    const syncAssistantMessage = (
+      content: string,
+      isStreaming: boolean,
+      generatedPdf?: GeneratedPdfDoc
+    ) => {
       setMessages((prev) =>
         prev.map((m) =>
           m.id === assistantMsgId
@@ -421,15 +533,43 @@ export const App: React.FC = () => {
                 content,
                 steps: [...stepsTrace],
                 isStreaming,
+                generatedPdf: generatedPdf || m.generatedPdf,
               }
             : m
         )
       );
     };
 
+    const savePdf = async (doc: GeneratedPdfDoc, step: StepTrace | undefined, action: AgentAction) => {
+      latestPdf = doc;
+      try {
+        const filename = await downloadGeneratedPdf(doc);
+        step?.actions.push({
+          action,
+          label: doc.title,
+          success: true,
+          message: `Built & downloaded PDF "${filename}"`,
+        });
+      } catch (err: any) {
+        step?.actions.push({
+          action,
+          label: doc.title,
+          success: false,
+          message: `PDF built but download failed: ${err?.message || String(err)}. Use the Download button.`,
+        });
+      }
+    };
+
+    const titleFromMarkdown = (md: string) =>
+      md.match(/^#\s+(.+)$/m)?.[1].replace(/[*_`]/g, '').trim();
+
     try {
       let finalAnswer = '';
       let forceScreenshotsNextStep = isScreenshotRequestedPrompt(userPrompt);
+      const userAskedForPdf = isPdfRequestedPrompt(userPrompt);
+      let pdfMeta: { title?: string; filename?: string } | null = userAskedForPdf ? {} : null;
+      let usedActionMode = false;
+      const knowledgeQuery = `${userPrompt} ${quote || ''}`;
 
       for (let stepNum = 1; stepNum <= settings.maxSteps; stepNum++) {
         if (abortController.signal.aborted) break;
@@ -441,37 +581,67 @@ export const App: React.FC = () => {
         );
         const snapshot = await getActivePageSnapshot({
           forceScreenshots: forceScreenshotsNextStep,
-          autoScreenshotFallback: settings.autoScreenshotFallback ?? true,
+          // When the user is asking about their own documents, don't switch to page screenshots
+          autoScreenshotFallback: activeDocs.length === 0 && (settings.autoScreenshotFallback ?? true),
           maxScreenshots: settings.maxScreenshots ?? 4,
         });
         forceScreenshotsNextStep = false;
+        lastSnapshotSeen = snapshot;
         setLastSnapshot(snapshot);
 
+        // Never try to get past CAPTCHAs / bot checks: hand control back to the user
+        if (snapshot.blockedByVerification) {
+          stepsTrace.push({
+            stepNumber: stepNum,
+            pageTitle: snapshot.title,
+            thinking: '',
+            summary: 'Page is asking for human verification.',
+            actions: [],
+            status: 'paused_for_submit',
+          });
+          finalAnswer =
+            `**${snapshot.title || 'This page'}** is showing a human-verification check (CAPTCHA). ` +
+            `Please complete it yourself in the tab, then send your request again and I'll continue from there.` +
+            (gatheredNotes.length ? `\n\n**What I found so far:**\n${gatheredNotes.map((n) => `- ${n}`).join('\n')}` : '');
+          syncAssistantMessage(finalAnswer, false, latestPdf);
+          return;
+        }
+
         const screenshots = snapshot.screenshots || [];
+        const allImages = [...uploadedImages, ...screenshots];
         const modelForStep =
-          screenshots.length > 0
+          allImages.length > 0
             ? settings.visionModel || settings.selectedModel
             : settings.selectedModel;
 
         const currentStep: StepTrace = {
           stepNumber: stepNum,
-          pageTitle: snapshot.title,
+          pageTitle: snapshot.restricted ? 'New tab' : snapshot.title,
           thinking: '',
           summary:
-            screenshots.length > 0
-              ? `Reading ${screenshots.length} screenshot(s) with ${modelForStep}...`
+            allImages.length > 0
+              ? `Reading ${allImages.length} image(s)/screenshot(s) with ${modelForStep}...`
               : '',
           screenshots: screenshots.length > 0 ? screenshots : undefined,
           actions: [],
           status: 'running',
         };
         stepsTrace.push(currentStep);
-        syncAssistantMessage(`Step ${stepNum}: Analyzing "${snapshot.title}"...`, true);
+        syncAssistantMessage(
+          snapshot.restricted
+            ? `Step ${stepNum}: Thinking...`
+            : `Step ${stepNum}: Analyzing "${snapshot.title}"...`,
+          true
+        );
 
         // 2. Think: Stream from local Ollama model
         const { system, user, isActionPrompt } = buildAgentPrompt({
           userInstruction: userPrompt,
           replyQuote: quote,
+          uploadedDocsBlock,
+          conversationBlock,
+          notes: gatheredNotes,
+          pdfRequested: userAskedForPdf,
           profile: workingProfile,
           snapshot,
           stepNumber: stepNum,
@@ -479,24 +649,28 @@ export const App: React.FC = () => {
           previousStepSummaries: previousSummaries,
           knowledgeBlock: retrieveRelevantKnowledge(
             knowledge,
-            `${userPrompt} ${quote || ''} ${snapshot.title} ${snapshot.headings.join(' ')}`,
-            screenshots.length > 0 ? 1200 : 1800
+            `${knowledgeQuery} ${snapshot.title} ${snapshot.headings.join(' ')}`,
+            allImages.length > 0 ? 1200 : 1800
           ),
         });
+        usedActionMode = usedActionMode || isActionPrompt;
 
         const stepResult = await streamOllamaStep({
           host: settings.ollamaHost,
           model: modelForStep,
           system,
           user,
-          images: screenshots.length > 0 ? screenshots : undefined,
+          images: allImages.length > 0 ? allImages : undefined,
           isActionPrompt,
           signal: abortController.signal,
+          numPredictReserve: !isActionPrompt && userAskedForPdf ? 6144 : undefined,
           onProgress: ({ thinking, rawContent }) => {
             currentStep.thinking = thinking;
             if (rawContent) {
               currentStep.summary = isActionPrompt
                 ? 'Preparing browser actions...'
+                : userAskedForPdf
+                ? 'Writing document...'
                 : 'Streaming answer...';
             }
             syncAssistantMessage(
@@ -513,17 +687,32 @@ export const App: React.FC = () => {
         currentStep.thinking = stepResult.thought || currentStep.thinking;
         currentStep.summary = stepResult.summary;
         finalAnswer = stepResult.answer || stepResult.summary;
+        if (stepResult.notes) {
+          gatheredNotes.push(
+            `${stepResult.notes.slice(0, 1200)}${snapshot.url && !snapshot.restricted ? ` (source: ${snapshot.url})` : ''}`
+          );
+        }
 
-        // Handle any `extract_to_memory` actions locally in side panel storage
-        const memoryActions = stepResult.actions.filter(
+        // Only the first navigation in a step is meaningful: anything after it would target
+        // element ids from a page that no longer exists.
+        const NAV_ACTIONS = new Set(['navigate', 'search_web', 'open_result', 'go_back']);
+        let stepActions = stepResult.actions;
+        const firstNavIdx = stepActions.findIndex((a) => NAV_ACTIONS.has(a.action));
+        if (firstNavIdx !== -1) stepActions = stepActions.slice(0, firstNavIdx + 1);
+
+        const memoryActions = stepActions.filter(
           (a) => a.action === 'extract_to_memory' && a.field && a.value
         );
-        const screenshotRequested = stepResult.actions.some(
-          (a) => a.action === 'screenshot'
+        const screenshotRequested = stepActions.some((a) => a.action === 'screenshot');
+        const pdfActions = stepActions.filter((a) => a.action === 'generate_pdf');
+        const domActions = stepActions.filter(
+          (a) =>
+            a.action !== 'extract_to_memory' &&
+            a.action !== 'screenshot' &&
+            a.action !== 'generate_pdf' &&
+            a.action !== 'done'
         );
-        const domActions = stepResult.actions.filter(
-          (a) => a.action !== 'extract_to_memory' && a.action !== 'screenshot'
-        );
+
         if (screenshotRequested) {
           forceScreenshotsNextStep = true;
           currentStep.actions.push({
@@ -531,6 +720,30 @@ export const App: React.FC = () => {
             success: true,
             message: 'Model requested visual screenshots for the next step.',
           });
+        }
+
+        // A generate_pdf with a full document is used as-is; otherwise the document is written
+        // in a dedicated Markdown pass once browsing is finished.
+        for (const pdfAct of pdfActions) {
+          pdfMeta = {
+            title: String(pdfAct.title || pdfMeta?.title || '').trim() || undefined,
+            filename: String(pdfAct.filename || pdfMeta?.filename || '').trim() || undefined,
+          };
+          const inlineContent = String(pdfAct.content || '').trim();
+          if (inlineContent.length >= 400) {
+            const title = pdfMeta.title || titleFromMarkdown(inlineContent) || 'Any Agent Document';
+            await savePdf(
+              {
+                title,
+                filename: pdfMeta.filename || `${title}.pdf`,
+                markdownContent: inlineContent,
+                createdAt: Date.now(),
+              },
+              currentStep,
+              pdfAct
+            );
+            finalAnswer = inlineContent;
+          }
         }
 
         for (const memAct of memoryActions) {
@@ -555,26 +768,35 @@ export const App: React.FC = () => {
           await saveProfile(workingProfile);
         }
 
-        // 3. Act: Execute any browser DOM actions on the active tab
+        // 3. Act: Execute any browser DOM / Web Surfing actions on the active tab
+        let navigated = false;
         if (domActions.length > 0) {
-          // Enrich fill actions with the user's prompt as a fallback hint if the model omitted a reason/label
           const enrichedDomActions = domActions.map((a) =>
             a.action === 'fill' && !a.label && !a.reason
               ? { ...a, reason: userPrompt }
               : a
           );
+          syncAssistantMessage(
+            `Step ${stepNum}: ${stepResult.summary || 'Running browser actions...'}`,
+            true,
+            latestPdf
+          );
           const execResult = await executeActionsOnActiveTab(enrichedDomActions, {
             highlight: settings.highlightElements,
             safeSubmitMode: settings.safeSubmitMode,
+            searchEngine: settings.searchEngine,
+            searchResults: snapshot.searchResults,
           });
 
           currentStep.actions.push(...execResult.logs);
+          navigated = execResult.logs.some((l) => l.success && NAV_ACTIONS.has(l.action.action));
 
           if (execResult.pausedForSubmit) {
             currentStep.status = 'paused_for_submit';
             syncAssistantMessage(
               `${finalAnswer}\n\n*(Paused before clicking final Submit button so you can review.)*`,
-              false
+              false,
+              latestPdf
             );
             break;
           }
@@ -587,27 +809,92 @@ export const App: React.FC = () => {
             : stepResult.summary;
         previousSummaries.push(actionSummaryText);
 
-        // Decide whether to finish or continue multi-step loop
-        if (
-          !screenshotRequested &&
-          (stepResult.status === 'complete' ||
-            domActions.length === 0 ||
-            domActions.some((a) => a.action === 'done'))
-        ) {
-          syncAssistantMessage(finalAnswer, false);
-          break;
-        }
+        // Keep going after surfing to a new page (the model hasn't seen it yet), after
+        // clicks/scrolls it asked to follow up on, or when it wants screenshots.
+        const wantsAnotherStep =
+          screenshotRequested ||
+          navigated ||
+          (stepResult.status === 'continue' && domActions.length > 0);
+        const isFinishing = !wantsAnotherStep || stepNum >= settings.maxSteps;
+
+        if (isFinishing) break;
 
         syncAssistantMessage(
-          `Step ${stepNum} complete. Inspecting updated page for Step ${stepNum + 1}...`,
-          true
+          `Step ${stepNum} complete. Reading the updated page for step ${stepNum + 1}...`,
+          true,
+          latestPdf
         );
-        await new Promise((r) => setTimeout(r, 900));
+        await new Promise((r) => setTimeout(r, 400));
+      }
+
+      if (abortController.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+
+      // PDF requested but not built yet → write the document, then build it
+      if (pdfMeta && !latestPdf) {
+        let documentMd = finalAnswer;
+        const lastStep = stepsTrace[stepsTrace.length - 1];
+
+        // In plain (non-browsing) mode the model already wrote the full document as its answer
+        if (usedActionMode || documentMd.trim().length < 200) {
+          if (lastStep) lastStep.summary = 'Writing the PDF document...';
+          syncAssistantMessage('Writing the document for your PDF...', true);
+          const writer = buildDocumentWriterPrompt({
+            userInstruction: userPrompt,
+            title: pdfMeta.title,
+            notes: gatheredNotes,
+            draftAnswer: finalAnswer,
+            snapshot: lastSnapshotSeen,
+            uploadedDocsBlock,
+            conversationBlock,
+            profile: workingProfile,
+            knowledgeBlock: retrieveRelevantKnowledge(knowledge, knowledgeQuery, 1500),
+          });
+          const written = await streamOllamaStep({
+            host: settings.ollamaHost,
+            model: settings.selectedModel,
+            system: writer.system,
+            user: writer.user,
+            isActionPrompt: false,
+            signal: abortController.signal,
+            temperature: 0.4,
+            numPredictReserve: 6144,
+            onProgress: ({ rawContent }) => {
+              if (rawContent) syncAssistantMessage(rawContent, true);
+            },
+          });
+          documentMd = written.answer;
+        }
+
+        // Strip chatty wrappers some models add around the document
+        documentMd = documentMd
+          .replace(/^\s*(here(?:'s| is)[^\n]*\n+)/i, '')
+          .replace(/^```(?:markdown|md)?\s*\n([\s\S]*?)\n```\s*$/i, '$1')
+          .trim();
+
+        if (documentMd.length > 20) {
+          const title =
+            pdfMeta.title ||
+            titleFromMarkdown(documentMd) ||
+            (lastSnapshotSeen && !lastSnapshotSeen.restricted ? lastSnapshotSeen.title : '') ||
+            'Any Agent Document';
+          await savePdf(
+            {
+              title,
+              filename: pdfMeta.filename || `${title}.pdf`,
+              markdownContent: documentMd,
+              createdAt: Date.now(),
+            },
+            lastStep,
+            { action: 'generate_pdf', title }
+          );
+          finalAnswer = documentMd;
+        }
       }
 
       syncAssistantMessage(
         finalAnswer || stepsTrace[stepsTrace.length - 1]?.summary || 'Done.',
-        false
+        false,
+        latestPdf
       );
     } catch (err: any) {
       const isAborted = err?.name === 'AbortError';
@@ -617,6 +904,12 @@ export const App: React.FC = () => {
           stepsTrace[stepsTrace.length - 1].summary = 'Stopped by user.';
         }
       }
+      const rawMessage = String(err?.message || err);
+      const friendly = /model .*not found|404/i.test(rawMessage)
+        ? `Error: ${rawMessage}. Pull that model with \`ollama pull <model>\`, or pick an installed one in Settings${
+            uploadedImages.length > 0 ? ' (images and scanned PDFs need a vision model such as gemma3 or llama3.2-vision)' : ''
+          }.`
+        : `Error: ${rawMessage}. Make sure Ollama is running locally (${settings.ollamaHost}).`;
       setMessages((prev) =>
         prev.map((m) => {
           if (m.id !== assistantMsgId) return m;
@@ -627,7 +920,8 @@ export const App: React.FC = () => {
             !m.content.startsWith('Capturing page screenshots') &&
             !m.content.startsWith('Step ') &&
             !m.content.startsWith('Thinking with ') &&
-            !m.content.startsWith('Drafting response');
+            !m.content.startsWith('Drafting response') &&
+            !m.content.startsWith('Writing the document');
 
           return {
             ...m,
@@ -635,9 +929,10 @@ export const App: React.FC = () => {
               ? hasMeaningfulPartial
                 ? `${m.content}\n\n*( Generation stopped by user )*\n`
                 : '*( Generation stopped by user )*'
-              : `Error: ${err?.message || String(err)}. Make sure Ollama is running locally (${settings.ollamaHost}).`,
+              : friendly,
             steps: [...stepsTrace],
             isStreaming: false,
+            generatedPdf: latestPdf || m.generatedPdf,
           };
         })
       );
@@ -921,11 +1216,90 @@ export const App: React.FC = () => {
                         </div>
                       )}
                       {msg.role === 'assistant' ? (
-                        <ErrorBoundary fallbackText="Couldn't render this message as Markdown.">
-                          <MarkdownRenderer content={msg.content} />
-                        </ErrorBoundary>
+                        <>
+                          <ErrorBoundary fallbackText="Couldn't render this message as Markdown.">
+                            <MarkdownRenderer content={msg.content} />
+                          </ErrorBoundary>
+
+                          {/* Generated PDF Card */}
+                          {msg.generatedPdf && (
+                            <div className="mt-2.5 flex items-center justify-between gap-2.5 rounded-xl bg-[#121216] border border-[#D97757]/40 px-3 py-2.5">
+                              <div className="flex items-center gap-2.5 min-w-0">
+                                <span className="w-8 h-8 rounded-lg bg-[#D97757]/15 border border-[#D97757]/30 flex items-center justify-center shrink-0">
+                                  <FileDown className="w-4 h-4 text-[#E5886A]" />
+                                </span>
+                                <div className="min-w-0">
+                                  <div className="text-xs font-semibold text-white truncate">
+                                    {msg.generatedPdf.title}
+                                  </div>
+                                  <div className="text-[10px] text-[#8E8D8A] truncate">
+                                    PDF Ready · {msg.generatedPdf.filename}
+                                  </div>
+                                </div>
+                              </div>
+                              <div className="shrink-0 flex items-center gap-1.5">
+                                <button
+                                  type="button"
+                                  onClick={() => previewGeneratedPdf(msg.generatedPdf!)}
+                                  className="flex items-center gap-1 px-2 py-1.5 rounded-lg border border-[#3A3A44] hover:border-[#D97757]/60 text-[#CBCAC4] hover:text-white text-[11px] transition-colors"
+                                  title="Open the PDF in a new tab"
+                                >
+                                  <Eye className="w-3.5 h-3.5" />
+                                  View
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => void downloadGeneratedPdf(msg.generatedPdf!)}
+                                  className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-[#D97757] hover:bg-[#E5886A] text-white text-[11px] font-medium transition-colors"
+                                >
+                                  <Download className="w-3.5 h-3.5" />
+                                  Download
+                                </button>
+                              </div>
+                            </div>
+                          )}
+
+                          {/* Quick Export Any Response as PDF */}
+                          {!msg.isStreaming && !msg.generatedPdf && msg.content.length > 140 && (
+                            <div className="pt-1.5 flex justify-end border-t border-[#24242C]/80">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const title =
+                                    msg.content.match(/^#\s+(.+)$/m)?.[1].replace(/[*_`]/g, '').trim() ||
+                                    (lastSnapshot && !lastSnapshot.restricted ? lastSnapshot.title : '') ||
+                                    'Any Agent Document';
+                                  void downloadGeneratedPdf({
+                                    title,
+                                    filename: `${title}.pdf`,
+                                    markdownContent: msg.content,
+                                    createdAt: Date.now(),
+                                  });
+                                }}
+                                className="inline-flex items-center gap-1 text-[10px] text-[#8E8D8A] hover:text-[#E5886A] transition-colors"
+                                title="Export this response as a PDF file"
+                              >
+                                <FileDown className="w-3 h-3" />
+                                Export as PDF
+                              </button>
+                            </div>
+                          )}
+                        </>
                       ) : (
                         <>
+                          {msg.attachments && msg.attachments.length > 0 && (
+                            <div className="mb-2 flex flex-wrap gap-1.5">
+                              {msg.attachments.map((att) => (
+                                <span
+                                  key={att.id}
+                                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-black/25 border border-white/20 text-[10px] text-white"
+                                >
+                                  <Paperclip className="w-2.5 h-2.5" />
+                                  <span className="truncate max-w-[140px]">{att.name}</span>
+                                </span>
+                              ))}
+                            </div>
+                          )}
                           {msg.quote && (
                             <div className="mb-1.5 pl-2 border-l-2 border-white/60 text-[11px] text-white/80 line-clamp-3 whitespace-pre-wrap break-words">
                               {msg.quote}
@@ -1016,6 +1390,14 @@ export const App: React.FC = () => {
                 e.preventDefault();
                 sendFromInput();
               }}
+              onDragOver={(e) => {
+                if (e.dataTransfer.types.includes('Files')) e.preventDefault();
+              }}
+              onDrop={(e) => {
+                if (!e.dataTransfer.files.length || isRunning) return;
+                e.preventDefault();
+                void attachFiles(Array.from(e.dataTransfer.files));
+              }}
               className="p-3 border-t border-[#24242C] bg-[#151519]"
             >
               {/* Prominent Live Thinking / Writing Stop Bar */}
@@ -1060,7 +1442,67 @@ export const App: React.FC = () => {
                   </button>
                 </div>
               )}
-              <div className="relative flex items-end gap-2 bg-[#101013] border border-[#2B2B34] focus-within:border-[#D97757]/80 rounded-2xl px-3 py-2 transition-all shadow-inner">
+              {parsingFiles.length > 0 && (
+                <div className="mb-2 flex items-center gap-1.5 text-[11px] text-[#A19F99]">
+                  <Loader2 className="w-3 h-3 animate-spin text-[#D97757]" />
+                  Reading {parsingFiles.join(', ')}...
+                </div>
+              )}
+              {attachError && (
+                <div className="mb-2 flex items-start justify-between gap-2 rounded-lg border border-rose-500/30 bg-rose-500/10 px-2.5 py-1.5 text-[11px] text-rose-200">
+                  <span className="break-words">{attachError}</span>
+                  <button type="button" onClick={() => setAttachError('')} className="shrink-0 hover:text-white">
+                    <X className="w-3 h-3" />
+                  </button>
+                </div>
+              )}
+              {attachedDocs.length > 0 && (
+                <div className="mb-2 flex flex-wrap gap-1.5">
+                  {attachedDocs.map((doc) => (
+                    <div
+                      key={doc.id}
+                      className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[#1E1E24] border border-[#32323D] text-[11px] text-[#E5E4E0]"
+                    >
+                      <Paperclip className="w-3 h-3 text-[#D97757] shrink-0" />
+                      <span className="truncate max-w-[150px]">{doc.name}</span>
+                      <span className="text-[9px] text-[#7E7D7A] shrink-0">
+                        {doc.imageDataUrl
+                          ? 'image'
+                          : doc.pageImages?.length
+                          ? 'scanned'
+                          : `${Math.max(1, Math.round(doc.textContent.length / 1000))}k chars`}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => removeAttachedDoc(doc.id)}
+                        className="text-[#8E8D8A] hover:text-rose-400"
+                        title="Remove file"
+                      >
+                        <X className="w-3 h-3" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <div className="relative flex items-end gap-2 bg-[#101013] border border-[#2B2B34] focus-within:border-[#D97757]/80 rounded-2xl px-2.5 py-2 transition-all shadow-inner">
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  multiple
+                  accept={UPLOAD_ACCEPT}
+                  onChange={handleAttachFiles}
+                  className="hidden"
+                />
+                <button
+                  type="button"
+                  disabled={isRunning}
+                  onClick={() => fileInputRef.current?.click()}
+                  className="shrink-0 p-2 rounded-xl text-[#8E8D8A] hover:text-white hover:bg-[#1E1E26] disabled:opacity-40 transition-colors"
+                  title="Attach documents (PDF, DOCX, PPTX, TXT, MD, CSV, JSON, code) or images"
+                >
+                  <Paperclip className="w-4 h-4" />
+                </button>
                 <textarea
                   ref={inputRef}
                   rows={2}
@@ -1079,7 +1521,9 @@ export const App: React.FC = () => {
                   placeholder={
                     replyQuote
                       ? 'Ask about the highlighted part...'
-                      : 'Ask anything about this page, or tell Any Agent what to fill...'
+                      : attachedDocs.length > 0
+                      ? 'Ask about your attached document(s), fill a form from them, or build a PDF...'
+                      : 'Surf a site, upload a doc, build a PDF, or auto-fill this page...'
                   }
                   disabled={isRunning}
                   className="flex-1 bg-transparent text-xs text-[#F3F2EE] placeholder-[#6E6D6A] resize-none focus:outline-none leading-relaxed"
@@ -1097,7 +1541,7 @@ export const App: React.FC = () => {
                 ) : (
                   <button
                     type="submit"
-                    disabled={!input.trim()}
+                    disabled={(!input.trim() && attachedDocs.length === 0) || parsingFiles.length > 0}
                     className="shrink-0 p-2 rounded-xl bg-gradient-to-br from-[#D97757] to-[#C46445] hover:from-[#E5886A] hover:to-[#D97757] disabled:opacity-35 text-white transition-all shadow-sm"
                     title="Send prompt"
                   >

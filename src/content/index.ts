@@ -3,6 +3,7 @@ import type {
   ActionExecutionLog,
   DistilledElement,
   PageSnapshot,
+  SearchResult,
 } from '../types/agent';
 
 const AGENT_ATTR = 'data-any-agent-id';
@@ -186,6 +187,99 @@ function resolveLabel(el: HTMLElement): string {
   return cleanText(el.innerText);
 }
 
+function decodeDdgUrl(href: string): string {
+  try {
+    const u = new URL(href, location.href);
+    if (/duckduckgo\.com$/.test(u.hostname) && u.pathname.startsWith('/l/')) {
+      const target = u.searchParams.get('uddg');
+      if (target) return decodeURIComponent(target);
+    }
+    return u.href;
+  } catch {
+    return href;
+  }
+}
+
+/** Parses organic results (with FULL urls) from Google / DuckDuckGo / Bing result pages. */
+function extractSearchResults(): SearchResult[] {
+  const host = location.hostname;
+  const results: SearchResult[] = [];
+  const seen = new Set<string>();
+
+  const push = (title: string, url: string, snippet: string) => {
+    const t = cleanText(title, 140);
+    if (!t || !/^https?:\/\//i.test(url) || seen.has(url)) return;
+    seen.add(url);
+    results.push({ title: t, url, snippet: cleanText(snippet, 220) });
+  };
+
+  try {
+    if (/duckduckgo\.com$/.test(host)) {
+      document
+        .querySelectorAll<HTMLElement>('.result:not(.result--ad), [data-testid="result"]')
+        .forEach((r) => {
+          const a = r.querySelector<HTMLAnchorElement>(
+            'a.result__a, a[data-testid="result-title-a"]'
+          );
+          if (!a) return;
+          const sn = r.querySelector<HTMLElement>('.result__snippet, [data-result="snippet"]');
+          push(a.innerText, decodeDdgUrl(a.href), sn?.innerText || '');
+        });
+    } else if (/bing\.com$/.test(host)) {
+      document.querySelectorAll<HTMLElement>('li.b_algo').forEach((r) => {
+        const a = r.querySelector<HTMLAnchorElement>('h2 a');
+        if (!a) return;
+        const sn = r.querySelector<HTMLElement>('.b_caption p, p');
+        push(a.innerText, a.href, sn?.innerText || '');
+      });
+    } else if (/(^|\.)google\.[a-z.]+$/.test(host) && location.pathname === '/search') {
+      document.querySelectorAll<HTMLAnchorElement>('#search a[href], #rso a[href]').forEach((a) => {
+        const h3 = a.querySelector('h3');
+        if (!h3) return;
+        let href = a.href;
+        try {
+          const u = new URL(a.href);
+          if (/google\./.test(u.hostname)) {
+            const q = u.searchParams.get('q');
+            if (u.pathname === '/url' && q) href = q;
+            else return;
+          }
+        } catch {
+          return;
+        }
+        const block = a.closest<HTMLElement>('div.g, div.tF2Cxc, div.MjjYud, div[data-hveid]');
+        const sn = block?.querySelector<HTMLElement>('.VwiC3b, [data-sncf]');
+        push(h3.innerText, href, sn?.innerText || '');
+      });
+    }
+  } catch {
+    // Selector drift on a search engine must never break the whole snapshot
+  }
+  return results.slice(0, 10);
+}
+
+/**
+ * Detects pages that are essentially a human-verification / bot-check wall.
+ * We never try to get past these: the agent stops and asks the user to complete them.
+ */
+function detectHumanVerification(): boolean {
+  const title = document.title || '';
+  if (location.pathname.startsWith('/sorry/')) return true;
+  if (/just a moment|attention required|are you a robot|verify you are human|security check|captcha/i.test(title)) {
+    return true;
+  }
+  const body = (document.body?.innerText || '').trim();
+  if (body.length > 1500) return false; // a real content page that merely embeds a widget
+  const hasWidget = !!document.querySelector(
+    'iframe[src*="recaptcha"], iframe[src*="hcaptcha"], iframe[src*="turnstile"], .g-recaptcha, .h-captcha, .cf-turnstile, #challenge-form, #cf-challenge-running'
+  );
+  const phrase =
+    /(verify (that )?you('| a)re (a )?human|unusual traffic from your computer|i'm not a robot|checking (if the site connection is secure|your browser before accessing)|complete the (security )?check to continue)/i.test(
+      body
+    );
+  return hasWidget || phrase;
+}
+
 export function distillPage(): PageSnapshot {
   document.querySelectorAll(`[${AGENT_ATTR}]`).forEach((el) => {
     el.removeAttribute(AGENT_ATTR);
@@ -307,7 +401,12 @@ export function distillPage(): PageSnapshot {
     elements.push(item);
   }
 
-  const lines = elements.map((el) => {
+  // On search-result pages, replace the noisy link list with a clean numbered results list
+  const searchResults = extractSearchResults();
+  const visibleElements =
+    searchResults.length > 0 ? elements.filter((e) => e.tag !== 'a') : elements;
+
+  const lines = visibleElements.map((el) => {
     const tagDesc = el.type ? `${el.tag}:${el.type}` : el.role ? `${el.tag}[role=${el.role}]` : el.tag;
     const parts: string[] = [`[${el.id}] <${tagDesc}>`];
     if (el.label) parts.push(`label="${el.label}"`);
@@ -333,7 +432,7 @@ export function distillPage(): PageSnapshot {
       ?.content?.trim() || '';
 
   const selectedText = window.getSelection()?.toString()?.trim().slice(0, 1500) || '';
-  const readableText = extractReadablePageContent(4200);
+  const readableText = extractReadablePageContent(9000);
 
   return {
     url: window.location.href,
@@ -341,9 +440,14 @@ export function distillPage(): PageSnapshot {
     metaDescription,
     selectedText,
     headings,
-    readableText,
-    elements,
+    readableText:
+      searchResults.length > 0
+        ? searchResults.map((r, i) => `${i + 1}. ${r.title} - ${r.snippet}`).join('\n')
+        : readableText,
+    elements: visibleElements,
     compactText: lines.join('\n'),
+    searchResults: searchResults.length > 0 ? searchResults : undefined,
+    blockedByVerification: detectHumanVerification(),
   };
 }
 
@@ -564,6 +668,36 @@ export async function executeActions(
           success: true,
           message: `Filled "${label}" with "${val}"`,
         });
+      } else if (act.action === 'press_enter') {
+        if (act.value && isFillableElement(el)) {
+          setNativeValue(el, String(act.value));
+        }
+        el.focus();
+        const enterOpts = {
+          key: 'Enter',
+          code: 'Enter',
+          keyCode: 13,
+          which: 13,
+          bubbles: true,
+          cancelable: true,
+        };
+        el.dispatchEvent(new KeyboardEvent('keydown', enterOpts));
+        el.dispatchEvent(new KeyboardEvent('keypress', enterOpts));
+        el.dispatchEvent(new KeyboardEvent('keyup', enterOpts));
+        const parentForm = el.closest('form');
+        if (parentForm) {
+          if (typeof parentForm.requestSubmit === 'function') {
+            parentForm.requestSubmit();
+          } else {
+            parentForm.submit();
+          }
+        }
+        logs.push({
+          action: act,
+          label,
+          success: true,
+          message: `Pressed Enter on "${label}"`,
+        });
       } else if (act.action === 'select') {
         const targetVal = String(act.value ?? '').toLowerCase().trim();
         if (el instanceof HTMLSelectElement) {
@@ -637,6 +771,9 @@ export async function executeActions(
           continue;
         }
 
+        // Links that open a new tab would silently take the agent off the tab it is driving
+        const clickedAnchor = el.closest('a') as HTMLAnchorElement | null;
+        if (clickedAnchor && clickedAnchor.target === '_blank') clickedAnchor.target = '_self';
         el.click();
         logs.push({
           action: act,
